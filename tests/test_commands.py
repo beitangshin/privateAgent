@@ -1,4 +1,5 @@
 from private_agent.transport.commands import parse_command
+from private_agent.run_telegram import _result_requests_restart
 
 
 def test_parse_read_command() -> None:
@@ -46,6 +47,55 @@ def test_parse_repo_search_command() -> None:
     assert parsed.kind == "repo_tool"
     assert parsed.tool_name == "search_repo"
     assert parsed.args == {"pattern": "FoodItemDao"}
+
+
+def test_parse_exec_command() -> None:
+    parsed = parse_command("/exec ls -la /tmp")
+    assert parsed.kind == "tool"
+    assert parsed.tool_name == "run_shell_command"
+    assert parsed.args == {"command": "ls -la /tmp"}
+
+
+def test_parse_find_command() -> None:
+    parsed = parse_command("/find hilTest | /home/hil")
+    assert parsed.kind == "tool"
+    assert parsed.tool_name == "find_paths"
+    assert parsed.args == {"pattern": "hilTest", "start_path": "/home/hil"}
+
+
+def test_parse_inspect_command() -> None:
+    parsed = parse_command("/inspect /home/hil/hilTest")
+    assert parsed.kind == "tool"
+    assert parsed.tool_name == "inspect_project"
+    assert parsed.args == {"path": "/home/hil/hilTest"}
+
+
+def test_parse_project_command() -> None:
+    parsed = parse_command("/project /home/hil/privateAgent")
+    assert parsed.kind == "tool"
+    assert parsed.tool_name == "project_map"
+    assert parsed.args == {"path": "/home/hil/privateAgent"}
+
+
+def test_parse_patch_command() -> None:
+    parsed = parse_command("/patch /tmp/demo.txt | old value | new value")
+    assert parsed.kind == "tool"
+    assert parsed.tool_name == "patch_file"
+    assert parsed.args == {
+        "path": "/tmp/demo.txt",
+        "old_text": "old value",
+        "new_text": "new value",
+    }
+
+
+def test_result_requests_restart_only_when_flag_is_set() -> None:
+    class Result:
+        def __init__(self, data):
+            self.data = data
+
+    assert _result_requests_restart(Result({"restart_required": True})) is True
+    assert _result_requests_restart(Result({"restart_required": False})) is False
+    assert _result_requests_restart(Result(None)) is False
 
 
 def test_parse_reset_command() -> None:

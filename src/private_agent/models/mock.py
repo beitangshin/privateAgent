@@ -1,25 +1,29 @@
 from __future__ import annotations
 
-from .base import ModelMessage, ModelPlan, ModelSummary
+from .base import ModelDecision, ModelMessage, ModelSummary
 
 
 class MockModelBackend:
-    async def plan(
+    async def decide_next_step(
         self,
         messages: list[ModelMessage],
         tools: list[dict[str, object]],
         session_context: dict[str, object] | None = None,
-    ) -> ModelPlan:
+        scratchpad: list[dict[str, object]] | None = None,
+    ) -> ModelDecision:
         latest = messages[-1].content if messages else ""
         prefix = ""
         if session_context and session_context.get("active_goal"):
             prefix = f"[goal={session_context['active_goal']}] "
-        return ModelPlan(
-            intent="mock_intent",
-            requires_confirmation=False,
-            steps=[],
-            response_style="short_status",
-            notes=f"{prefix}Mock backend received: {latest}",
+        scratchpad = scratchpad or []
+        if scratchpad:
+            return ModelDecision(
+                thought="I have enough information.",
+                final_answer=f"{prefix}Mock backend completed: {latest}",
+            )
+        return ModelDecision(
+            thought="No tool is needed for the mock backend.",
+            final_answer=f"{prefix}Mock backend received: {latest}",
         )
 
     async def summarize(

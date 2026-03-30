@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 
 from private_agent.app import build_app
 from private_agent.config import load_settings
@@ -38,6 +40,15 @@ def _format_result_message(result: object) -> str:
     return str(result)
 
 
+def _result_requests_restart(result: object) -> bool:
+    data = getattr(result, "data", None)
+    return bool(isinstance(data, dict) and data.get("restart_required"))
+
+
+def _restart_current_process() -> None:
+    os.execv(sys.executable, [sys.executable, "-m", "private_agent.run_telegram"])
+
+
 async def main() -> None:
     settings = load_settings()
     if not settings.telegram_bot_token:
@@ -63,6 +74,9 @@ async def main() -> None:
                         parsed.args or {},
                     )
                     await client.send_message(update.message.chat_id, _format_result_message(result))
+                    if _result_requests_restart(result):
+                        await asyncio.sleep(0.2)
+                        _restart_current_process()
                 elif parsed.kind == "repo_select":
                     result = service.set_active_repo(update.message, (parsed.args or {}).get("repo_name", ""))
                     await client.send_message(update.message.chat_id, _format_result_message(result))
@@ -73,6 +87,9 @@ async def main() -> None:
                         parsed.args or {},
                     )
                     await client.send_message(update.message.chat_id, _format_result_message(result))
+                    if _result_requests_restart(result):
+                        await asyncio.sleep(0.2)
+                        _restart_current_process()
                 elif parsed.kind == "knowledge_search":
                     result = service.search_knowledge(update.message, (parsed.args or {}).get("query", ""))
                     await client.send_message(update.message.chat_id, _format_result_message(result))
@@ -87,6 +104,9 @@ async def main() -> None:
                 elif parsed.kind == "approve" and parsed.trace_id:
                     result = await service.approve(update.message, parsed.trace_id)
                     await client.send_message(update.message.chat_id, _format_result_message(result))
+                    if _result_requests_restart(result):
+                        await asyncio.sleep(0.2)
+                        _restart_current_process()
                 elif parsed.kind == "cancel" and parsed.trace_id:
                     result = service.cancel(update.message, parsed.trace_id)
                     await client.send_message(update.message.chat_id, _format_result_message(result))
@@ -101,6 +121,9 @@ async def main() -> None:
                 elif not update.message.text.strip().startswith("/"):
                     result = await service.handle_natural_language(update.message)
                     await client.send_message(update.message.chat_id, _format_result_message(result))
+                    if _result_requests_restart(result):
+                        await asyncio.sleep(0.2)
+                        _restart_current_process()
                 else:
                     await client.send_message(update.message.chat_id, HELP_TEXT)
             except Exception as exc:  # noqa: BLE001

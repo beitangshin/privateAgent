@@ -1,4 +1,7 @@
 from __future__ import annotations
+import copy
+import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -11,7 +14,7 @@ from private_agent.audit.logger import AuditEvent, AuditLogger
 from private_agent.auth.allowlist import SenderAuthorizer
 from private_agent.executor.runtime import Executor
 from private_agent.knowledge import LocalKnowledgeBase
-from private_agent.models.base import ModelBackend, ModelMessage, ModelPlanStep
+from private_agent.models.base import ModelBackend, ModelMessage
 from private_agent.policy.engine import PolicyEngine
 from private_agent.storage.state import StateStore
 from private_agent.tools.base import ToolRegistry
@@ -27,6 +30,9 @@ class HandleResult:
 
 
 class AgentService:
+    _MAX_REACT_TURNS = 6
+    _MAX_IDENTICAL_ACTION_REPEATS = 2
+
     def __init__(
         self,
         *,
@@ -51,151 +57,38 @@ class AgentService:
         self._enabled_tool_names = enabled_tool_names
         self._conversation_history_messages = conversation_history_messages
         self._knowledge_base = knowledge_base
+        self._agent_root = Path.cwd().resolve()
 
     async def handle_natural_language(self, message: IncomingMessage) -> HandleResult:
         trace_id = uuid.uuid4().hex[:12]
         started = time.perf_counter()
-        plan_summary: dict[str, Any] | None = None
+        react_trace: list[dict[str, Any]] = []
         result_state = "handled"
         session_context = self._session_context(message)
         knowledge_context = self._knowledge_context(message, session_context)
         session_context["knowledge_snippets"] = knowledge_context
+        session_context["task_frame"] = self._build_task_frame(message, session_context)
         conversation = self._conversation_messages(message)
         try:
             self._authorizer.verify(message.sender_id)
             self._authorizer.verify_chat(message.chat_id)
+            direct_result = await self._try_handle_local_filesystem_query(message, session_context)
+            if direct_result is not None:
+                return direct_result
             tools = [
                 self._tool_descriptor(spec)
                 for spec in self._registry.list_specs()
                 if self._is_tool_enabled(spec.name)
             ]
-            plan = await self._model_backend.plan(
-                conversation,
-                tools,
-                session_context=session_context,
-            )
-            plan_summary = {
-                "intent": plan.intent,
-                "requires_confirmation": plan.requires_confirmation,
-                "steps": [
-                    {"tool_name": step.tool_name, "arguments": step.arguments} for step in plan.steps
-                ],
-                "response_style": plan.response_style,
-                "notes": plan.notes,
-            }
-
-            if not plan.steps:
-                summary_text = plan.notes or "No local action was required."
-                self._append_conversation_exchange(message, summary_text)
-                self._update_agent_session(
-                    message,
-                    active_goal=self._derive_active_goal(message.text, session_context),
-                    plan_intent=plan.intent,
-                    plan_notes=plan.notes,
-                    tool_names=[],
-                    assistant_text=summary_text,
-                )
-                return HandleResult(
-                    trace_id=trace_id,
-                    status="ok",
-                    message=summary_text,
-                    data={"intent": plan.intent, "steps_executed": 0},
-                )
-
-            if len(plan.steps) > 5:
-                return HandleResult(
-                    trace_id=trace_id,
-                    status="deny",
-                    message="model proposed too many steps; refusing plan",
-                    data={"intent": plan.intent, "proposed_steps": len(plan.steps)},
-                )
-
-            executed, pending = await self._execute_plan_steps(
-                plan.steps,
-                confirmed=False,
-            )
-            if pending:
-                if pending["status"] != "needs_confirmation":
-                    return HandleResult(
-                        trace_id=trace_id,
-                        status="deny" if pending["status"] == "denied" else "error",
-                        message=pending["reason"],
-                        data={"intent": plan.intent, "step": pending["tool_name"]},
-                    )
-                self._save_pending_confirmation(
-                    trace_id=trace_id,
-                    sender_id=message.sender_id,
-                    chat_id=message.chat_id,
-                    payload={
-                        "kind": "plan",
-                        "plan_intent": plan.intent,
-                        "plan_notes": plan.notes,
-                        "original_text": message.text,
-                        "steps": [
-                            {"tool_name": step.tool_name, "args": step.arguments} for step in plan.steps
-                        ],
-                    },
-                )
-                return HandleResult(
-                    trace_id=trace_id,
-                    status="allow_with_confirmation",
-                    message=(
-                        f"model planned '{plan.intent}' but at least one step needs confirmation. "
-                        f"Reply with CONFIRM {trace_id}"
-                    ),
-                    data={"intent": plan.intent, "pending_steps": len(plan.steps)},
-                )
-
-            summary_context = self._sanitize_executed_steps_for_model(executed)
-            if summary_context is None:
-                local_message = self._render_local_execution_summary(plan.intent, plan.notes, executed)
-                self._append_conversation_exchange(message, local_message)
-                self._update_agent_session(
-                    message,
-                    active_goal=self._derive_active_goal(message.text, session_context),
-                    plan_intent=plan.intent,
-                    plan_notes=plan.notes,
-                    tool_names=[step["tool_name"] for step in executed],
-                    assistant_text=local_message,
-                )
-                return HandleResult(
-                    trace_id=trace_id,
-                    status="ok",
-                    message=local_message,
-                    data={
-                        "intent": plan.intent,
-                        "steps_executed": len(executed),
-                        "executed_steps": executed,
-                    },
-                )
-
-            summary = await self._model_backend.summarize(
-                conversation,
-                {
-                    "intent": plan.intent,
-                    "plan_notes": plan.notes,
-                    "executed_steps": summary_context,
-                },
-            )
-            final_message = summary.content or plan.notes or "plan executed successfully"
-            self._append_conversation_exchange(message, final_message)
-            self._update_agent_session(
-                message,
-                active_goal=self._derive_active_goal(message.text, session_context),
-                plan_intent=plan.intent,
-                plan_notes=plan.notes,
-                tool_names=[step["tool_name"] for step in executed],
-                assistant_text=final_message,
-            )
-            return HandleResult(
+            return await self._run_react_loop(
                 trace_id=trace_id,
-                status="ok",
-                message=final_message,
-                data={
-                    "intent": plan.intent,
-                    "steps_executed": len(executed),
-                    "executed_steps": executed,
-                },
+                message=message,
+                conversation=conversation,
+                tools=tools,
+                session_context=session_context,
+                scratchpad=[],
+                active_goal=self._derive_active_goal(message.text, session_context),
+                react_trace=react_trace,
             )
         except Exception as exc:  # noqa: BLE001
             result_state = "error"
@@ -219,7 +112,7 @@ class AgentService:
                         "chat_id": message.chat_id,
                         "message_id": message.message_id,
                         "text": message.text,
-                        "plan": plan_summary,
+                        "react_trace": react_trace,
                         "knowledge_paths": [item["path"] for item in knowledge_context],
                     },
                 )
@@ -255,11 +148,16 @@ class AgentService:
                 )
             result = await self._executor.run(tool_name, args)
             if result.ok:
-                return HandleResult(
+                handle_result = HandleResult(
                     trace_id=trace_id,
                     status="ok",
                     message="tool execution succeeded",
                     data=result.data,
+                )
+                return self._finalize_handle_result_after_possible_self_edit(
+                    message,
+                    handle_result,
+                    [{"tool_name": tool_name, "result": result.data}],
                 )
             return HandleResult(trace_id=trace_id, status="error", message=result.error or "error")
         finally:
@@ -339,64 +237,110 @@ class AgentService:
                 status="deny",
                 message="trace does not belong to this sender/chat",
             )
-        if pending.get("kind") == "plan":
-            steps = [
-                ModelPlanStep(tool_name=step["tool_name"], arguments=step.get("args", {}))
-                for step in pending.get("steps", [])
-            ]
-            executed, rejected = await self._execute_plan_steps(steps, confirmed=True)
+        if pending.get("kind") == "react_step":
+            result = await self._executor.run(pending["tool_name"], pending["args"])
             self._delete_pending_confirmation(trace_id)
-            if rejected:
-                return HandleResult(
-                    trace_id=trace_id,
-                    status="deny" if rejected["status"] == "denied" else "error",
-                    message=rejected["reason"],
-                    data={"rejected_step": rejected},
+            if not result.ok:
+                return HandleResult(trace_id=trace_id, status="error", message=result.error or "error")
+            scratchpad = list(pending.get("scratchpad", []))
+            observation_for_model = self._observation_for_model(pending["tool_name"], result.data)
+            if observation_for_model is None:
+                local_message = self._render_local_execution_summary(
+                    str(pending.get("active_goal", "")) or "react_task",
+                    str(pending.get("thought", "")),
+                    [
+                        {
+                            "tool_name": pending["tool_name"],
+                            "arguments": pending["args"],
+                            "result": result.data,
+                        }
+                    ],
                 )
-            summary_context = self._sanitize_executed_steps_for_model(executed)
-            if summary_context is None:
-                return HandleResult(
+                original_message = IncomingMessage(
+                    platform=message.platform,
+                    sender_id=message.sender_id,
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                    text=str(pending.get("original_text", "")),
+                    timestamp=message.timestamp,
+                    attachments=[],
+                )
+                self._append_conversation_exchange(original_message, local_message)
+                self._update_agent_session(
+                    original_message,
+                    active_goal=str(pending.get("active_goal", "")) or str(pending.get("original_text", "")),
+                    plan_intent=str(pending.get("active_goal", "")) or "react_task",
+                    plan_notes=str(pending.get("thought", "")),
+                    tool_names=[pending["tool_name"]],
+                    assistant_text=local_message,
+                )
+                self._delete_pending_confirmation(trace_id)
+                handle_result = HandleResult(
                     trace_id=trace_id,
                     status="ok",
-                    message=self._render_local_execution_summary(
-                        pending.get("plan_intent", "confirmed_plan"),
-                        pending.get("plan_notes", ""),
-                        executed,
-                    ),
+                    message=local_message,
                     data={
-                        "intent": pending.get("plan_intent", "confirmed_plan"),
-                        "steps_executed": len(executed),
-                        "executed_steps": executed,
+                        "intent": str(pending.get("active_goal", "")) or "react_task",
+                        "steps_executed": 1,
+                        "executed_steps": [
+                            {
+                                "thought": pending.get("thought", ""),
+                                "action": pending["tool_name"],
+                                "action_input": pending["args"],
+                                "observation": {"suppressed_untrusted_result": True},
+                            }
+                        ],
                     },
                 )
-
-            summary = await self._model_backend.summarize(
-                [ModelMessage(role="user", content=pending.get("original_text", ""))],
+                return self._finalize_handle_result_after_possible_self_edit(
+                    original_message,
+                    handle_result,
+                    [{"tool_name": pending["tool_name"], "result": result.data}],
+                )
+            scratchpad.append(
                 {
-                    "intent": pending.get("plan_intent", "confirmed_plan"),
-                    "plan_notes": pending.get("plan_notes", ""),
-                    "executed_steps": summary_context,
-                },
+                    "thought": pending.get("thought", ""),
+                    "action": pending["tool_name"],
+                    "action_input": pending["args"],
+                    "observation": observation_for_model,
+                }
             )
-            return HandleResult(
+            return await self._run_react_loop(
                 trace_id=trace_id,
-                status="ok",
-                message=summary.content or "confirmed plan execution succeeded",
-                data={
-                    "intent": pending.get("plan_intent", "confirmed_plan"),
-                    "steps_executed": len(executed),
-                    "executed_steps": executed,
-                },
+                message=IncomingMessage(
+                    platform=message.platform,
+                    sender_id=message.sender_id,
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                    text=str(pending.get("original_text", "")),
+                    timestamp=message.timestamp,
+                    attachments=[],
+                ),
+                conversation=[ModelMessage(role="user", content=str(pending.get("original_text", "")))],
+                tools=[
+                    self._tool_descriptor(spec)
+                    for spec in self._registry.list_specs()
+                    if self._is_tool_enabled(spec.name)
+                ],
+                session_context=self._session_context(message),
+                scratchpad=scratchpad,
+                active_goal=str(pending.get("active_goal", "")) or str(pending.get("original_text", "")),
+                react_trace=[],
             )
 
         result = await self._executor.run(pending["tool_name"], pending["args"])
         self._delete_pending_confirmation(trace_id)
         if result.ok:
-            return HandleResult(
+            handle_result = HandleResult(
                 trace_id=trace_id,
                 status="ok",
                 message="confirmed tool execution succeeded",
                 data=result.data,
+            )
+            return self._finalize_handle_result_after_possible_self_edit(
+                message,
+                handle_result,
+                [{"tool_name": pending["tool_name"], "result": result.data}],
             )
         return HandleResult(trace_id=trace_id, status="error", message=result.error or "error")
 
@@ -714,6 +658,326 @@ class AgentService:
             return previous_goal
         return text
 
+    def _build_task_frame(
+        self, message: IncomingMessage, session_context: dict[str, Any]
+    ) -> dict[str, Any]:
+        text = message.text.strip()
+        active_goal = self._derive_active_goal(text, session_context)
+        explicit_path = self._extract_path_from_text(text)
+        named_target = self._extract_named_target(text)
+        lowered = text.lower()
+
+        if explicit_path:
+            request_kind = "path_specific"
+        elif self._looks_like_run_help_request(text):
+            request_kind = "execute_or_run"
+        elif any(marker in lowered for marker in ["文件夹", "目录", "list ", "under ", "read ", "读取"]):
+            request_kind = "filesystem_lookup"
+        elif any(marker in lowered for marker in ["搜索", "search", "find ", "查找"]):
+            request_kind = "search_or_discovery"
+        else:
+            request_kind = "general"
+
+        hidden_steps: list[str] = []
+        if request_kind == "execute_or_run":
+            hidden_steps = [
+                "locate the real target path",
+                "identify the project or artifact type",
+                "infer the best entry point or command",
+                "execute only after the target is concrete",
+            ]
+        elif request_kind in {"filesystem_lookup", "search_or_discovery"}:
+            hidden_steps = [
+                "identify the most likely target",
+                "prefer high-signal candidates over noisy matches",
+                "read only the minimum files needed before acting",
+            ]
+
+        return {
+            "latest_user_text": text,
+            "normalized_goal": active_goal,
+            "request_kind": request_kind,
+            "is_follow_up": self._looks_like_followup(text),
+            "explicit_paths": [explicit_path] if explicit_path else [],
+            "named_targets": [named_target] if named_target else [],
+            "hidden_steps": hidden_steps,
+            "decision_hints": [
+                "infer the user's real goal before choosing a tool",
+                "compress ambiguity into one concrete next objective",
+                "prefer high-signal tools over broad exploration",
+                "ignore noisy low-value matches when better evidence exists",
+                "only ask the user to choose when top candidates remain genuinely ambiguous",
+            ],
+        }
+
+    async def _try_handle_local_filesystem_query(
+        self,
+        message: IncomingMessage,
+        session_context: dict[str, Any],
+    ) -> HandleResult | None:
+        text = message.text.strip()
+        if not text:
+            return None
+        if text.startswith("/"):
+            return None
+
+        explicit_path = self._extract_path_from_text(text)
+        if explicit_path and not self._looks_like_edit_request(text):
+            return await self._handle_explicit_local_path(message, explicit_path, session_context)
+
+        target_name = self._extract_named_target(text)
+        if not target_name:
+            return None
+
+        lowered = text.lower()
+        wants_listing = any(
+            marker in lowered for marker in ["文件夹下", "目录下", "有哪些文件", "what files", "list files", "under "]
+        )
+        wants_run_help = any(marker in text for marker in ["怎么跑", "如何跑", "运行", "跑完整", "完整的"]) or any(
+            marker in lowered for marker in ["how to run", "run ", "execute "]
+        )
+        if not wants_listing and not wants_run_help:
+            return None
+
+        matches = self._find_named_paths(target_name, prefer_directories=True)
+        if not matches:
+            return HandleResult(
+                trace_id=uuid.uuid4().hex[:12],
+                status="ok",
+                message=f"没有找到名为 `{target_name}` 的目录。",
+            )
+        if len(matches) > 1:
+            chosen_match = self._choose_best_named_path(matches, wants_run_help=wants_run_help)
+            if chosen_match is not None:
+                return await self._handle_explicit_local_path(message, chosen_match, session_context)
+            lines = [f"找到了多个名为 `{target_name}` 的目录，请指定完整路径："]
+            lines.extend(f"- {path}" for path in matches[:5])
+            return HandleResult(
+                trace_id=uuid.uuid4().hex[:12],
+                status="ok",
+                message="\n".join(lines),
+                data={"matches": matches[:5]},
+            )
+        return await self._handle_explicit_local_path(message, matches[0], session_context)
+
+    async def _handle_explicit_local_path(
+        self,
+        message: IncomingMessage,
+        path_text: str,
+        session_context: dict[str, Any],
+    ) -> HandleResult:
+        trace_id = uuid.uuid4().hex[:12]
+        candidate = Path(path_text).expanduser()
+        preferred_tool = "list_allowed_directory"
+        if candidate.exists() and candidate.is_file():
+            preferred_tool = "read_allowed_file"
+        elif self._looks_like_run_help_request(message.text):
+            preferred_tool = "inspect_project"
+        elif self._looks_like_file_request(message.text):
+            preferred_tool = "read_allowed_file"
+
+        result = await self._executor.run(preferred_tool, {"path": str(candidate)})
+        if result.ok:
+            tool_result = {
+                "tool_name": preferred_tool,
+                "arguments": {"path": str(candidate)},
+                "result": result.data,
+            }
+            rendered = self._render_local_execution_summary(
+                str(session_context.get("active_goal", "")).strip() or message.text.strip(),
+                "Handled as a direct local filesystem request.",
+                [tool_result],
+            )
+            self._append_conversation_exchange(message, rendered)
+            self._update_agent_session(
+                message,
+                active_goal=self._derive_active_goal(message.text, session_context),
+                plan_intent="direct_local_filesystem_request",
+                plan_notes="handled without model reasoning",
+                tool_names=[preferred_tool],
+                assistant_text=rendered,
+            )
+            return HandleResult(
+                trace_id=trace_id,
+                status="ok",
+                message=rendered,
+                data={"intent": "direct_local_filesystem_request", "steps_executed": 1},
+            )
+        return HandleResult(trace_id=trace_id, status="error", message=result.error or "error")
+
+    def _extract_path_from_text(self, text: str) -> str | None:
+        path_match = re.search(r"(/[\w.\-~/]+(?:/[\w.\-]+)*)", text)
+        if path_match:
+            return path_match.group(1)
+        return None
+
+    def _extract_named_target(self, text: str) -> str | None:
+        patterns = [
+            r"([A-Za-z0-9._-]+)\s*文件夹",
+            r"([A-Za-z0-9._-]+)\s*目录",
+            r"(?:运行|跑|执行|完整的)\s*([A-Za-z0-9._-]+)",
+            r"find\s+files?\s+under\s+([A-Za-z0-9._-]+)",
+            r"(?:run|execute)\s+([A-Za-z0-9._-]+)",
+            r"under\s+([A-Za-z0-9._-]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    def _find_named_paths(self, target_name: str, *, prefer_directories: bool) -> list[str]:
+        roots = list(getattr(self._executor, "_context").allowed_roots)
+        max_depth = 6
+        max_matches = 5
+        matches: list[str] = []
+        target_name_lower = target_name.lower()
+        for root in roots:
+            broad_search = root.resolve() == Path("/").resolve()
+            for current_root, dirs, files in os.walk(root):
+                current_root_path = Path(current_root)
+                dirs[:] = [
+                    entry
+                    for entry in dirs
+                    if not self._should_skip_search_path(
+                        current_root_path / entry, broad_search=broad_search
+                    )
+                ]
+                depth = len(Path(current_root).relative_to(root).parts)
+                if depth >= max_depth:
+                    dirs[:] = []
+                candidates = dirs if prefer_directories else files
+                for candidate_name in candidates:
+                    if candidate_name.lower() == target_name_lower:
+                        candidate_path = current_root_path / candidate_name
+                        if self._should_skip_search_path(candidate_path, broad_search=broad_search):
+                            continue
+                        matches.append(str(candidate_path))
+        ranked = sorted(set(matches), key=self._path_search_priority)
+        return ranked[:max_matches]
+
+    def _choose_best_named_path(self, matches: list[str], *, wants_run_help: bool) -> str | None:
+        if len(matches) <= 1:
+            return matches[0] if matches else None
+
+        scored: list[tuple[int, str]] = []
+        for path_text in matches:
+            score = self._candidate_path_score(path_text, wants_run_help=wants_run_help)
+            scored.append((score, path_text))
+
+        scored.sort(key=lambda item: (-item[0], self._path_search_priority(item[1])))
+        best_score, best_path = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else None
+
+        if best_score <= 0:
+            return None
+        if second_score is not None and best_score - second_score < 3:
+            return None
+        return best_path
+
+    def _candidate_path_score(self, path_text: str, *, wants_run_help: bool) -> int:
+        path = Path(path_text)
+        score = 0
+        priority_bucket, depth, _ = self._path_search_priority(path_text)
+        score += max(0, 8 - (priority_bucket * 2))
+        score += max(0, 6 - depth)
+
+        if not path.exists() or not path.is_dir():
+            return score
+
+        entries = {item.name for item in path.iterdir()}
+        project_markers = {
+            "pyproject.toml",
+            "requirements.txt",
+            "setup.py",
+            "package.json",
+            "Cargo.toml",
+            "go.mod",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "gradlew",
+            "Makefile",
+            "README.md",
+            "README.txt",
+        }
+        score += sum(4 for marker in project_markers if marker in entries)
+
+        if wants_run_help:
+            executable_suffixes = {".sh", ".py", ".pl", ".rb"}
+            for item in path.iterdir():
+                if item.is_file() and item.suffix.lower() in executable_suffixes:
+                    score += 2
+                if item.is_file() and item.name.lower().startswith(("run", "start", "launch", "test")):
+                    score += 3
+                if item.is_dir() and item.name in {"src", "scripts", "tests"}:
+                    score += 1
+        return score
+
+    def _should_skip_search_path(self, path: Path, *, broad_search: bool) -> bool:
+        parts = path.parts
+        if "__pycache__" in parts:
+            return True
+        if broad_search and self._is_path_under(path, Path("/tmp")):
+            for part in parts:
+                lowered = part.lower()
+                if lowered.startswith("pytest-of-") or lowered.startswith("pytest-"):
+                    return True
+        return False
+
+    def _path_search_priority(self, path_text: str) -> tuple[int, int, str]:
+        path = Path(path_text)
+        path_string = str(path)
+        home = Path(os.path.expanduser("~")).resolve()
+        cwd = Path.cwd().resolve()
+
+        if self._is_path_under(path, home):
+            bucket = 0
+        elif self._is_path_under(path, cwd.parent):
+            bucket = 1
+        elif self._is_path_under(path, cwd):
+            bucket = 2
+        elif self._is_path_under(path, Path("/tmp")):
+            bucket = 4
+        else:
+            bucket = 3
+        return (bucket, len(path.parts), path_string.lower())
+
+    def _is_path_under(self, path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _looks_like_file_request(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(marker in lowered for marker in ["read ", "读取", "内容", "open ", "查看文件"])
+
+    def _looks_like_edit_request(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(
+            marker in lowered
+            for marker in [
+                "修改",
+                "改一下",
+                "改成",
+                "编辑",
+                "patch",
+                "replace",
+                "update ",
+                "change ",
+                "fix ",
+                "rewrite ",
+            ]
+        )
+
+    def _looks_like_run_help_request(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(marker in text for marker in ["怎么跑", "如何跑", "运行", "跑完整", "完整的"]) or any(
+            marker in lowered for marker in ["how to run", "run ", "execute ", "start ", "launch "]
+        )
+
     def _looks_like_followup(self, text: str) -> bool:
         lowered = text.lower().strip()
         followup_markers = [
@@ -810,8 +1074,84 @@ class AgentService:
         result = step.get("result") or {}
         if tool_name == "web_search":
             return self._render_web_search_step(result)
+        if tool_name == "inspect_project":
+            return self._render_inspect_project_step(result)
+        if tool_name == "project_map":
+            return self._render_project_map_step(result)
+        if tool_name == "patch_file":
+            return self._render_patch_file_step(result)
         rendered = json.dumps(result, ensure_ascii=False, indent=2)
         return [f"[{tool_name}]", rendered]
+
+    def _render_inspect_project_step(self, result: dict[str, Any]) -> list[str]:
+        lines = ["[inspect_project]"]
+        path = str(result.get("path", "")).strip()
+        if path:
+            lines.append(f"Path: {path}")
+
+        detected_types = result.get("detected_types") or []
+        if detected_types:
+            lines.append("Detected types: " + ", ".join(str(item) for item in detected_types))
+        else:
+            lines.append("Detected types: no strong project markers found yet")
+
+        likely_entrypoints = result.get("likely_entrypoints") or []
+        if likely_entrypoints:
+            lines.append(f"Best guess entrypoint: {likely_entrypoints[0]}")
+            if len(likely_entrypoints) > 1:
+                lines.append("Other entrypoints:")
+                lines.extend(f"- {item}" for item in likely_entrypoints[1:5])
+
+        suggested_commands = result.get("suggested_commands") or []
+        if suggested_commands:
+            lines.append(f"Best guess command: {suggested_commands[0]}")
+            if len(suggested_commands) > 1:
+                lines.append("Other commands:")
+                lines.extend(f"- {item}" for item in suggested_commands[1:5])
+
+        readme_path = str(result.get("readme_path", "") or "").strip()
+        if readme_path:
+            lines.append(f"README: {readme_path}")
+
+        entry_names = result.get("entry_names") or []
+        if entry_names:
+            lines.append("Top-level entries: " + ", ".join(str(item) for item in entry_names[:12]))
+
+        return lines
+
+    def _render_project_map_step(self, result: dict[str, Any]) -> list[str]:
+        lines = ["[project_map]"]
+        path = str(result.get("path", "")).strip()
+        if path:
+            lines.append(f"Path: {path}")
+        detected_types = result.get("detected_types") or []
+        if detected_types:
+            lines.append("Detected types: " + ", ".join(str(item) for item in detected_types))
+        likely_entrypoints = result.get("likely_entrypoints") or []
+        if likely_entrypoints:
+            lines.append(f"Best guess entrypoint: {likely_entrypoints[0]}")
+        tree = result.get("tree") or []
+        if tree:
+            lines.append("Project tree:")
+            lines.extend(f"- {line}" for line in tree[:12])
+        suggested_commands = result.get("suggested_commands") or []
+        if suggested_commands:
+            lines.append("Suggested commands:")
+            lines.extend(f"- {item}" for item in suggested_commands[:4])
+        return lines
+
+    def _render_patch_file_step(self, result: dict[str, Any]) -> list[str]:
+        path = str(result.get("path", "")).strip()
+        replacements = result.get("replacements")
+        bytes_written = result.get("bytes_written")
+        lines = ["[patch_file]"]
+        if path:
+            lines.append(f"Updated: {path}")
+        if replacements is not None:
+            lines.append(f"Replacements: {replacements}")
+        if bytes_written is not None:
+            lines.append(f"Bytes written: {bytes_written}")
+        return lines
 
     def _render_web_search_step(self, result: dict[str, Any]) -> list[str]:
         lines = [f"Web search results for: {result.get('query', '')}"]
@@ -844,40 +1184,298 @@ class AgentService:
         )
         return lines
 
-    async def _execute_plan_steps(
+    async def _run_react_loop(
         self,
-        steps: list[ModelPlanStep],
         *,
-        confirmed: bool,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-        executed: list[dict[str, Any]] = []
-        for step in steps:
-            spec = self._registry.get(step.tool_name)
-            decision = self._policy.evaluate(spec)
-            if decision.state == "deny":
-                return executed, {
-                    "status": "denied",
-                    "tool_name": step.tool_name,
-                    "reason": decision.reason,
-                }
-            if decision.state == "allow_with_confirmation" and not confirmed:
-                return executed, {
-                    "status": "needs_confirmation",
-                    "tool_name": step.tool_name,
-                    "reason": decision.reason,
-                }
-            result = await self._executor.run(step.tool_name, step.arguments)
-            if not result.ok:
-                return executed, {
-                    "status": "error",
-                    "tool_name": step.tool_name,
-                    "reason": result.error or "tool execution failed",
-                }
-            executed.append(
+        trace_id: str,
+        message: IncomingMessage,
+        conversation: list[ModelMessage],
+        tools: list[dict[str, Any]],
+        session_context: dict[str, Any],
+        scratchpad: list[dict[str, Any]],
+        active_goal: str,
+        react_trace: list[dict[str, Any]],
+    ) -> HandleResult:
+        executed_tool_names = [
+            str(step.get("action", "")).strip() for step in scratchpad if step.get("action")
+        ]
+        for _ in range(self._MAX_REACT_TURNS):
+            decision = await self._model_backend.decide_next_step(
+                conversation,
+                tools,
+                session_context=session_context,
+                scratchpad=copy.deepcopy(scratchpad),
+            )
+            react_trace.append(
                 {
-                    "tool_name": step.tool_name,
-                    "arguments": step.arguments,
-                    "result": result.data,
+                    "thought": decision.thought,
+                    "action": decision.action,
+                    "action_input": decision.action_input,
+                    "final_answer": decision.final_answer,
                 }
             )
-        return executed, None
+            if decision.final_answer:
+                final_message = decision.final_answer.strip()
+                handle_result = HandleResult(
+                    trace_id=trace_id,
+                    status="ok",
+                    message=final_message,
+                    data={
+                        "intent": active_goal or "react_task",
+                        "steps_executed": len(executed_tool_names),
+                        "executed_steps": scratchpad,
+                    },
+                )
+                if self._scratchpad_modified_self_agent(scratchpad):
+                    return self._finalize_handle_result_after_possible_self_edit(
+                        message,
+                        handle_result,
+                        [
+                            {
+                                "tool_name": str(step.get("action", "")),
+                                "result": step.get("observation"),
+                            }
+                            for step in scratchpad
+                        ],
+                    )
+                self._append_conversation_exchange(message, final_message)
+                self._update_agent_session(
+                    message,
+                    active_goal=active_goal,
+                    plan_intent=active_goal or "react_task",
+                    plan_notes=decision.thought,
+                    tool_names=executed_tool_names,
+                    assistant_text=final_message,
+                )
+                return handle_result
+
+            if not decision.action:
+                raise RuntimeError("model did not provide an action or final answer")
+
+            if self._has_repeated_action_loop(scratchpad, decision.action, decision.action_input):
+                loop_message = (
+                    f"agent stopped after repeating the same action '{decision.action}' "
+                    "without reaching a final answer"
+                )
+                self._append_conversation_exchange(message, loop_message)
+                self._update_agent_session(
+                    message,
+                    active_goal=active_goal,
+                    plan_intent=active_goal or "react_task",
+                    plan_notes="react loop stopped due to repeated identical action",
+                    tool_names=executed_tool_names,
+                    assistant_text=loop_message,
+                )
+                return HandleResult(
+                    trace_id=trace_id,
+                    status="error",
+                    message=loop_message,
+                    data={
+                        "intent": active_goal or "react_task",
+                        "steps_executed": len(executed_tool_names),
+                        "executed_steps": scratchpad,
+                    },
+                )
+
+            spec = self._registry.get(decision.action)
+            policy_decision = self._policy.evaluate(spec)
+            if policy_decision.state == "deny":
+                return HandleResult(trace_id=trace_id, status="deny", message=policy_decision.reason)
+            if policy_decision.state == "allow_with_confirmation":
+                self._save_pending_confirmation(
+                    trace_id=trace_id,
+                    sender_id=message.sender_id,
+                    chat_id=message.chat_id,
+                    payload={
+                        "kind": "react_step",
+                        "original_text": message.text,
+                        "active_goal": active_goal,
+                        "thought": decision.thought,
+                        "tool_name": decision.action,
+                        "args": decision.action_input,
+                        "scratchpad": scratchpad,
+                    },
+                )
+                return HandleResult(
+                    trace_id=trace_id,
+                    status="allow_with_confirmation",
+                    message=(
+                        f"tool '{decision.action}' needs confirmation. "
+                        f"Reply with CONFIRM {trace_id}"
+                    ),
+                    data={"intent": active_goal or "react_task", "pending_action": decision.action},
+                )
+
+            result = await self._executor.run(decision.action, decision.action_input)
+            if not result.ok:
+                scratchpad.append(
+                    {
+                        "thought": decision.thought,
+                        "action": decision.action,
+                        "action_input": decision.action_input,
+                        "observation": {"error": result.error or "tool execution failed"},
+                    }
+                )
+                executed_tool_names.append(decision.action)
+                continue
+
+            step_record = {
+                "thought": decision.thought,
+                "action": decision.action,
+                "action_input": decision.action_input,
+                "observation": result.data,
+            }
+            scratchpad.append(step_record)
+            executed_tool_names.append(decision.action)
+
+            observation_for_model = self._observation_for_model(decision.action, result.data)
+            if observation_for_model is None:
+                local_message = self._render_local_execution_summary(
+                    active_goal or "react_task",
+                    decision.thought,
+                    [
+                        {
+                            "tool_name": decision.action,
+                            "arguments": decision.action_input,
+                            "result": result.data,
+                        }
+                    ],
+                )
+                self._append_conversation_exchange(message, local_message)
+                self._update_agent_session(
+                    message,
+                    active_goal=active_goal,
+                    plan_intent=active_goal or "react_task",
+                    plan_notes=decision.thought,
+                    tool_names=executed_tool_names,
+                    assistant_text=local_message,
+                )
+                handle_result = HandleResult(
+                    trace_id=trace_id,
+                    status="ok",
+                    message=local_message,
+                    data={
+                        "intent": active_goal or "react_task",
+                        "steps_executed": len(executed_tool_names),
+                        "executed_steps": scratchpad,
+                    },
+                )
+                return self._finalize_handle_result_after_possible_self_edit(
+                    message,
+                    handle_result,
+                    [{"tool_name": decision.action, "result": result.data}],
+                )
+
+            scratchpad[-1]["observation"] = observation_for_model
+
+        fallback = "I could not finish the task safely within the step limit."
+        self._append_conversation_exchange(message, fallback)
+        self._update_agent_session(
+            message,
+            active_goal=active_goal,
+            plan_intent=active_goal or "react_task",
+            plan_notes="react loop exceeded max turns",
+            tool_names=executed_tool_names,
+            assistant_text=fallback,
+        )
+        return HandleResult(
+            trace_id=trace_id,
+            status="error",
+            message=fallback,
+            data={
+                "intent": active_goal or "react_task",
+                "steps_executed": len(executed_tool_names),
+                "executed_steps": scratchpad,
+            },
+        )
+
+    def _observation_for_model(self, tool_name: str, result: dict[str, Any] | None) -> dict[str, Any] | None:
+        spec = self._registry.get(tool_name)
+        if not spec.include_result_in_model_context:
+            return None
+        return result or {}
+
+    def _has_repeated_action_loop(
+        self,
+        scratchpad: list[dict[str, Any]],
+        action: str,
+        action_input: dict[str, Any],
+    ) -> bool:
+        recent_actions = [
+            (
+                str(step.get("action", "")).strip(),
+                json.dumps(step.get("action_input", {}), ensure_ascii=False, sort_keys=True),
+            )
+            for step in scratchpad[-self._MAX_IDENTICAL_ACTION_REPEATS :]
+            if step.get("action")
+        ]
+        if len(recent_actions) < self._MAX_IDENTICAL_ACTION_REPEATS:
+            return False
+        current = (action.strip(), json.dumps(action_input, ensure_ascii=False, sort_keys=True))
+        return all(item == current for item in recent_actions)
+
+    def _scratchpad_modified_self_agent(self, scratchpad: list[dict[str, Any]]) -> bool:
+        for step in scratchpad:
+            if self._tool_result_modified_self_agent(
+                str(step.get("action", "")),
+                step.get("observation"),
+            ):
+                return True
+        return False
+
+    def _tool_result_modified_self_agent(self, tool_name: str, result: dict[str, Any] | None) -> bool:
+        if tool_name != "patch_file" or not isinstance(result, dict):
+            return False
+        path_text = str(result.get("path", "")).strip()
+        if not path_text:
+            return False
+        candidate = Path(path_text).resolve()
+        try:
+            candidate.relative_to(self._agent_root)
+            return True
+        except ValueError:
+            return False
+
+    def _clear_conversation_state(self, message: IncomingMessage) -> None:
+        def updater(data: dict[str, Any]) -> dict[str, Any]:
+            histories = data.setdefault("conversation_histories", {})
+            histories.pop(self._conversation_session_key(message), None)
+            sessions = data.setdefault("agent_sessions", {})
+            sessions.pop(self._agent_session_key(message), None)
+            return data
+
+        self._state_store.update(updater)
+
+    def _finalize_handle_result_after_possible_self_edit(
+        self,
+        message: IncomingMessage,
+        result: HandleResult,
+        executed_steps: list[dict[str, Any]],
+    ) -> HandleResult:
+        if not any(
+            self._tool_result_modified_self_agent(
+                str(step.get("tool_name", "")),
+                step.get("result"),
+            )
+            for step in executed_steps
+        ):
+            return result
+        self._clear_conversation_state(message)
+        reset_notice = (
+            "Self-agent code changed. Conversation memory was cleared for this chat. "
+            "Send the next instruction as a fresh turn."
+        )
+        combined_message = result.message.strip()
+        if combined_message:
+            combined_message = f"{combined_message}\n\n{reset_notice}"
+        else:
+            combined_message = reset_notice
+        data = dict(result.data or {})
+        data["restart_required"] = True
+        data["conversation_reset"] = True
+        return HandleResult(
+            trace_id=result.trace_id,
+            status=result.status,
+            message=combined_message,
+            data=data,
+        )

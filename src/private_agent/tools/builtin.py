@@ -4,6 +4,7 @@ import json
 import locale
 import os
 import platform
+import fnmatch
 import shlex
 import shutil
 import socket
@@ -284,6 +285,156 @@ def _run_json_command(argv: list[str], *, timeout_sec: int = 15) -> Any:
         raise ToolError("command returned invalid JSON") from exc
 
 
+def _entrypoint_priority(path_text: str) -> tuple[int, str]:
+    lowered = path_text.lower()
+    if lowered.startswith("scripts/start") and lowered.endswith(".sh"):
+        return (0, lowered)
+    if lowered.startswith("scripts/run") and lowered.endswith(".sh"):
+        return (1, lowered)
+    if lowered.startswith("scripts/") and lowered.endswith(".sh"):
+        return (2, lowered)
+    if lowered.startswith("scripts/") and lowered.endswith(".py"):
+        return (3, lowered)
+    if lowered.startswith("start") and lowered.endswith(".sh"):
+        return (4, lowered)
+    if lowered.startswith("run") and lowered.endswith(".sh"):
+        return (5, lowered)
+    if lowered.endswith(".sh"):
+        return (6, lowered)
+    if lowered.endswith(".py"):
+        return (7, lowered)
+    return (8, lowered)
+
+
+def _collect_project_insights(project_path: Path) -> dict[str, Any]:
+    markers = {
+        "python": ["pyproject.toml", "requirements.txt", "setup.py", "pytest.ini"],
+        "node": ["package.json", "pnpm-lock.yaml", "yarn.lock"],
+        "java_gradle": ["build.gradle", "build.gradle.kts", "gradlew"],
+        "java_maven": ["pom.xml", "mvnw"],
+        "go": ["go.mod"],
+        "rust": ["Cargo.toml"],
+        "docker": ["Dockerfile", "docker-compose.yml", "docker-compose.yaml"],
+    }
+    present_items = sorted(project_path.iterdir(), key=lambda item: item.name.lower())
+    present_entries = {item.name for item in present_items}
+    detected_types: list[str] = []
+    marker_hits: dict[str, list[str]] = {}
+    for project_type, expected in markers.items():
+        hits = [name for name in expected if name in present_entries]
+        if hits:
+            detected_types.append(project_type)
+            marker_hits[project_type] = hits
+
+    likely_entrypoints: list[str] = []
+    shell_like_files: list[str] = []
+    ignored_suffixes = {".log", ".txt", ".md", ".json", ".yaml", ".yml"}
+    for item in present_items:
+        if not item.is_file():
+            continue
+        lowered = item.name.lower()
+        if item.suffix.lower() in ignored_suffixes:
+            continue
+        if lowered.endswith((".sh", ".py", ".pl", ".rb")):
+            shell_like_files.append(item.name)
+            likely_entrypoints.append(item.name)
+        if lowered.startswith(("run", "start", "launch", "test")) and item.suffix.lower() in {
+            ".sh",
+            ".py",
+            ".pl",
+            ".rb",
+        }:
+            likely_entrypoints.append(item.name)
+
+    scripts_dir = project_path / "scripts"
+    if scripts_dir.exists() and scripts_dir.is_dir():
+        detected_types.append("script_bundle")
+        marker_hits["script_bundle"] = ["scripts"]
+        for script in sorted(scripts_dir.iterdir(), key=lambda entry: entry.name.lower()):
+            if script.is_file() and script.suffix.lower() in {".sh", ".py"}:
+                likely_entrypoints.append(f"scripts/{script.name}")
+
+    if ".venv" in present_entries and "python" not in detected_types:
+        detected_types.append("python_environment")
+        marker_hits["python_environment"] = [".venv"]
+
+    if shell_like_files and "script_bundle" not in detected_types:
+        detected_types.append("script_bundle")
+        marker_hits.setdefault("script_bundle", []).extend(sorted(shell_like_files))
+
+    suggested_commands: list[str] = []
+    if "python" in detected_types:
+        suggested_commands.extend(["python3 -m pytest -q", "python3 -m pip install -e ."])
+    if "node" in detected_types:
+        suggested_commands.extend(["npm test", "npm run build", "npm start"])
+    if "java_gradle" in detected_types:
+        suggested_commands.extend(["./gradlew test", "./gradlew build"])
+    if "java_maven" in detected_types:
+        suggested_commands.extend(["./mvnw test", "./mvnw package"])
+    if "go" in detected_types:
+        suggested_commands.extend(["go test ./...", "go build ./..."])
+    if "rust" in detected_types:
+        suggested_commands.extend(["cargo test", "cargo build"])
+    if "python_environment" in detected_types:
+        suggested_commands.extend(["source .venv/bin/activate", "python3 --version"])
+    if "script_bundle" in detected_types:
+        suggested_commands.extend(["ls -la scripts", "find . -maxdepth 2 -type f | sort"])
+        ranked_entrypoints = sorted(
+            dict.fromkeys(likely_entrypoints),
+            key=lambda item: _entrypoint_priority(item),
+        )
+        for entrypoint in ranked_entrypoints[:3]:
+            if entrypoint.endswith(".sh"):
+                suggested_commands.append(f"bash {entrypoint}")
+            elif entrypoint.endswith(".py"):
+                suggested_commands.append(f"python3 {entrypoint}")
+
+    readme_candidates = [project_path / "README.md", project_path / "readme.md", project_path / "README.txt"]
+    readme_path = next((path for path in readme_candidates if path.exists()), None)
+    return {
+        "detected_types": sorted(set(detected_types)),
+        "marker_hits": marker_hits,
+        "suggested_commands": list(dict.fromkeys(suggested_commands))[:8],
+        "likely_entrypoints": sorted(
+            dict.fromkeys(likely_entrypoints),
+            key=lambda item: _entrypoint_priority(item),
+        )[:8],
+        "readme_path": str(readme_path) if readme_path else None,
+        "entry_names": sorted(present_entries)[:50],
+    }
+
+
+def _build_project_tree(
+    root: Path,
+    *,
+    max_depth: int,
+    max_entries: int,
+) -> list[str]:
+    lines: list[str] = []
+    entries_seen = 0
+
+    def walk(current: Path, depth: int) -> None:
+        nonlocal entries_seen
+        if depth > max_depth or entries_seen >= max_entries:
+            return
+        try:
+            children = sorted(current.iterdir(), key=lambda item: item.name.lower())
+        except OSError:
+            return
+        for child in children:
+            if entries_seen >= max_entries:
+                return
+            indent = "  " * depth
+            suffix = "/" if child.is_dir() else ""
+            lines.append(f"{indent}{child.name}{suffix}")
+            entries_seen += 1
+            if child.is_dir() and child.name not in {".git", ".venv", "__pycache__"}:
+                walk(child, depth + 1)
+
+    walk(root, 0)
+    return lines
+
+
 @dataclass(slots=True)
 class PingInput(ToolInputModel):
     pass
@@ -341,6 +492,10 @@ class ReadAllowedFileInput(ToolInputModel):
 
 def read_allowed_file(data: ReadAllowedFileInput, context: ToolContext) -> dict[str, Any]:
     path = _resolve_allowed_path(data.path, context.allowed_roots)
+    if not path.exists():
+        raise ToolError(f"path '{path}' does not exist")
+    if not path.is_file():
+        raise ToolError(f"path '{path}' is a directory; use /list <path> instead")
     content = path.read_text(encoding="utf-8")
     return {
         "path": str(path),
@@ -366,8 +521,10 @@ def list_allowed_directory(
     data: ListAllowedDirectoryInput, context: ToolContext
 ) -> dict[str, Any]:
     path = _resolve_allowed_path(data.path, context.allowed_roots)
+    if not path.exists():
+        raise ToolError(f"path '{path}' does not exist")
     if not path.is_dir():
-        raise ToolError(f"path '{path}' is not a directory")
+        raise ToolError(f"path '{path}' is a file; use /read <path> instead")
     entries = []
     for item in sorted(path.iterdir(), key=lambda entry: entry.name.lower()):
         entries.append(
@@ -437,6 +594,55 @@ def read_repo_file(data: ReadRepoFileInput, context: ToolContext) -> dict[str, A
         "path": str(path),
         "content": content[: data.max_chars],
         "truncated": len(content) > data.max_chars,
+    }
+
+
+@dataclass(slots=True)
+class FindPathsInput(ToolInputModel):
+    pattern: str
+    start_path: str = "."
+    directories_only: bool = False
+    max_results: int = 20
+
+    @classmethod
+    def field_aliases(cls) -> dict[str, str]:
+        return {"name": "pattern", "path": "start_path"}
+
+    def __post_init__(self) -> None:
+        if not self.pattern or len(self.pattern.strip()) > 200:
+            raise ToolError("pattern must be between 1 and 200 characters")
+        if not 1 <= self.max_results <= 100:
+            raise ToolError("max_results must be between 1 and 100")
+
+
+def find_paths(data: FindPathsInput, context: ToolContext) -> dict[str, Any]:
+    start_path = _resolve_allowed_path(data.start_path, context.allowed_roots)
+    if not start_path.exists():
+        raise ToolError(f"path '{start_path}' does not exist")
+    pattern = data.pattern.strip().lower()
+    matches: list[dict[str, Any]] = []
+    for current_root, dirs, files in os.walk(start_path):
+        names = dirs if data.directories_only else dirs + files
+        for name in names:
+            lowered = name.lower()
+            if pattern in lowered or fnmatch.fnmatch(lowered, pattern):
+                full_path = Path(current_root) / name
+                matches.append(
+                    {
+                        "path": str(full_path),
+                        "is_dir": full_path.is_dir(),
+                    }
+                )
+                if len(matches) >= data.max_results:
+                    return {
+                        "pattern": data.pattern,
+                        "start_path": str(start_path),
+                        "matches": matches,
+                    }
+    return {
+        "pattern": data.pattern,
+        "start_path": str(start_path),
+        "matches": matches,
     }
 
 
@@ -576,6 +782,144 @@ def run_repo_command(data: RunRepoCommandInput, context: ToolContext) -> dict[st
         "stdout": _truncate_text(stdout.strip()),
         "stderr": _truncate_text(stderr.strip()),
         "ok": code == 0,
+    }
+
+
+@dataclass(slots=True)
+class RunShellCommandInput(ToolInputModel):
+    command: str
+    workdir: str | None = None
+    timeout_sec: int = 120
+
+    @classmethod
+    def field_aliases(cls) -> dict[str, str]:
+        return {"cmd": "command", "cwd": "workdir"}
+
+    def __post_init__(self) -> None:
+        if not self.command or len(self.command.strip()) > 4000:
+            raise ToolError("command must be between 1 and 4000 characters")
+        if not 1 <= self.timeout_sec <= 3600:
+            raise ToolError("timeout_sec must be between 1 and 3600")
+
+
+def run_shell_command(data: RunShellCommandInput, __: ToolContext) -> dict[str, Any]:
+    workdir: Path | None = None
+    if data.workdir:
+        workdir = Path(data.workdir).expanduser().resolve()
+        if not workdir.exists():
+            raise ToolError(f"workdir '{workdir}' does not exist")
+        if not workdir.is_dir():
+            raise ToolError(f"workdir '{workdir}' is not a directory")
+
+    code, stdout, stderr = _run_subprocess(
+        ["bash", "-lc", data.command],
+        workdir=workdir or Path.cwd(),
+        timeout_sec=data.timeout_sec,
+    )
+    return {
+        "command": data.command,
+        "workdir": str(workdir or Path.cwd()),
+        "exit_code": code,
+        "stdout": _truncate_text(stdout.strip(), max_chars=20000),
+        "stderr": _truncate_text(stderr.strip(), max_chars=20000),
+        "ok": code == 0,
+    }
+
+
+@dataclass(slots=True)
+class InspectProjectInput(ToolInputModel):
+    path: str
+
+    def __post_init__(self) -> None:
+        if not self.path:
+            raise ToolError("path is required")
+
+
+def inspect_project(data: InspectProjectInput, context: ToolContext) -> dict[str, Any]:
+    project_path = _resolve_allowed_path(data.path, context.allowed_roots)
+    if not project_path.exists():
+        raise ToolError(f"path '{project_path}' does not exist")
+    if not project_path.is_dir():
+        raise ToolError(f"path '{project_path}' is not a directory")
+    insights = _collect_project_insights(project_path)
+    return {"path": str(project_path), **insights}
+
+
+@dataclass(slots=True)
+class ProjectMapInput(ToolInputModel):
+    path: str
+    max_depth: int = 3
+    max_entries: int = 120
+
+    def __post_init__(self) -> None:
+        if not self.path:
+            raise ToolError("path is required")
+        if not 1 <= self.max_depth <= 6:
+            raise ToolError("max_depth must be between 1 and 6")
+        if not 10 <= self.max_entries <= 500:
+            raise ToolError("max_entries must be between 10 and 500")
+
+
+def project_map(data: ProjectMapInput, context: ToolContext) -> dict[str, Any]:
+    project_path = _resolve_allowed_path(data.path, context.allowed_roots)
+    if not project_path.exists():
+        raise ToolError(f"path '{project_path}' does not exist")
+    if not project_path.is_dir():
+        raise ToolError(f"path '{project_path}' is not a directory")
+
+    insights = _collect_project_insights(project_path)
+    return {
+        "path": str(project_path),
+        "max_depth": data.max_depth,
+        "max_entries": data.max_entries,
+        "tree": _build_project_tree(project_path, max_depth=data.max_depth, max_entries=data.max_entries),
+        **insights,
+    }
+
+
+@dataclass(slots=True)
+class PatchFileInput(ToolInputModel):
+    path: str
+    old_text: str
+    new_text: str
+    replace_all: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.path:
+            raise ToolError("path is required")
+        if self.old_text == "":
+            raise ToolError("old_text must be a non-empty exact snippet to replace")
+        if len(self.old_text) > 50000 or len(self.new_text) > 50000:
+            raise ToolError("old_text and new_text must be at most 50000 characters")
+
+
+def patch_file(data: PatchFileInput, context: ToolContext) -> dict[str, Any]:
+    path = _resolve_allowed_path(data.path, context.allowed_roots)
+    if not path.exists():
+        raise ToolError(f"path '{path}' does not exist")
+    if not path.is_file():
+        raise ToolError(f"path '{path}' is not a file")
+
+    original = path.read_text(encoding="utf-8", errors="replace")
+    occurrences = original.count(data.old_text)
+    if occurrences == 0:
+        raise ToolError("old_text was not found in the target file")
+    if not data.replace_all and occurrences > 1:
+        raise ToolError(
+            "old_text matched multiple times; refine the snippet or set replace_all=true"
+        )
+
+    replaced = (
+        original.replace(data.old_text, data.new_text)
+        if data.replace_all
+        else original.replace(data.old_text, data.new_text, 1)
+    )
+    path.write_text(replaced, encoding="utf-8")
+    return {
+        "path": str(path),
+        "replacements": occurrences if data.replace_all else 1,
+        "bytes_written": path.stat().st_size,
+        "replace_all": data.replace_all,
     }
 
 
@@ -932,7 +1276,7 @@ def web_search(data: WebSearchInput, context: ToolContext) -> dict[str, Any]:
         "allowed_domains": list(context.web_search_allowed_domains),
         "content_trust": "untrusted_external_content",
         "prompt_injection_protection": (
-            "web results are never fed back into model summarize context"
+            "web results are never fed into any model prompt, memory, or planning scratchpad"
         ),
     }
 
@@ -1042,6 +1386,17 @@ def build_builtin_tools() -> list[ToolSpec]:
             handler=read_repo_file,
         ),
         ToolSpec(
+            name="find_paths",
+            description="Find files or directories by pattern under an allowlisted root.",
+            category="filesystem_read",
+            risk_level="low",
+            side_effects=False,
+            requires_confirmation=False,
+            timeout_sec=60,
+            input_model=FindPathsInput,
+            handler=find_paths,
+        ),
+        ToolSpec(
             name="search_repo",
             description="Search text inside an allowlisted repository using ripgrep.",
             category="filesystem_read",
@@ -1084,6 +1439,50 @@ def build_builtin_tools() -> list[ToolSpec]:
             timeout_sec=600,
             input_model=RunRepoCommandInput,
             handler=run_repo_command,
+        ),
+        ToolSpec(
+            name="run_shell_command",
+            description="Run an arbitrary shell command on the local host.",
+            category="shell_restricted",
+            risk_level="high",
+            side_effects=True,
+            requires_confirmation=False,
+            timeout_sec=3600,
+            input_model=RunShellCommandInput,
+            handler=run_shell_command,
+        ),
+        ToolSpec(
+            name="inspect_project",
+            description="Inspect a directory and infer project type plus likely run/test commands.",
+            category="filesystem_read",
+            risk_level="low",
+            side_effects=False,
+            requires_confirmation=False,
+            timeout_sec=30,
+            input_model=InspectProjectInput,
+            handler=inspect_project,
+        ),
+        ToolSpec(
+            name="project_map",
+            description="Summarize a local project's structure, key files, likely entrypoints, and tree.",
+            category="filesystem_read",
+            risk_level="low",
+            side_effects=False,
+            requires_confirmation=False,
+            timeout_sec=45,
+            input_model=ProjectMapInput,
+            handler=project_map,
+        ),
+        ToolSpec(
+            name="patch_file",
+            description="Apply an exact text replacement to a local file.",
+            category="filesystem_write",
+            risk_level="high",
+            side_effects=True,
+            requires_confirmation=False,
+            timeout_sec=30,
+            input_model=PatchFileInput,
+            handler=patch_file,
         ),
         ToolSpec(
             name="capture_system_info",

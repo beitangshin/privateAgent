@@ -31,18 +31,27 @@ class ModelSummary:
 
 
 @dataclass(slots=True)
+class ModelDecision:
+    thought: str = ""
+    action: str | None = None
+    action_input: dict[str, Any] = field(default_factory=dict)
+    final_answer: str | None = None
+
+
+@dataclass(slots=True)
 class ModelResponse:
     content: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ModelBackend(Protocol):
-    async def plan(
+    async def decide_next_step(
         self,
         messages: list[ModelMessage],
         tools: list[dict[str, Any]],
         session_context: dict[str, Any] | None = None,
-    ) -> ModelPlan:
+        scratchpad: list[dict[str, Any]] | None = None,
+    ) -> ModelDecision:
         ...
 
     async def summarize(

@@ -30,6 +30,11 @@ HELP_TEXT = """Available commands:
 /repo read <path>
 /repo search <pattern>
 /repo cmd <command_id>
+/exec <command>
+/find <pattern> [| <start_path>]
+/inspect <path>
+/project <path>
+/patch <path> | <old_text> | <new_text>
 /tools
 /read <path>
 /list <path>
@@ -123,6 +128,47 @@ def parse_command(text: str) -> ParsedCommand:
                 kind="repo_tool",
                 tool_name="run_repo_command",
                 args={"command_id": remainder},
+            )
+        return ParsedCommand(kind="help")
+    if command == "/exec" and rest:
+        return ParsedCommand(
+            kind="tool",
+            tool_name="run_shell_command",
+            args={"command": rest},
+        )
+    if command == "/find" and rest:
+        if "|" in rest:
+            pattern, start_path = [part.strip() for part in rest.split("|", maxsplit=1)]
+            return ParsedCommand(
+                kind="tool",
+                tool_name="find_paths",
+                args={"pattern": pattern, "start_path": start_path},
+            )
+        return ParsedCommand(
+            kind="tool",
+            tool_name="find_paths",
+            args={"pattern": rest},
+        )
+    if command == "/inspect" and rest:
+        return ParsedCommand(
+            kind="tool",
+            tool_name="inspect_project",
+            args={"path": rest},
+        )
+    if command == "/project" and rest:
+        return ParsedCommand(
+            kind="tool",
+            tool_name="project_map",
+            args={"path": rest},
+        )
+    if command == "/patch" and rest:
+        patch_parts = [part.strip() for part in rest.split("|", maxsplit=2)]
+        if len(patch_parts) == 3 and all(part != "" for part in patch_parts):
+            path, old_text, new_text = patch_parts
+            return ParsedCommand(
+                kind="tool",
+                tool_name="patch_file",
+                args={"path": path, "old_text": old_text, "new_text": new_text},
             )
         return ParsedCommand(kind="help")
     if command == "/tools":

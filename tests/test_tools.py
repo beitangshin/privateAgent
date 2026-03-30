@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import private_agent.tools.builtin as builtin_tools
 from private_agent.tools import ToolContext, ToolRegistry, build_builtin_tools
 
@@ -47,6 +49,35 @@ def test_read_allowed_file_accepts_file_path_alias(tmp_path: Path) -> None:
     result = spec.handler(validated, context)
 
     assert result["content"] == "hello alias"
+
+
+def test_read_allowed_file_rejects_directory_with_helpful_message(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("read_allowed_file")
+
+    with pytest.raises(Exception, match="use /list <path> instead"):
+        spec.handler(spec.input_model(path=str(context.allowed_roots[0])), context)
+
+
+def test_list_allowed_directory_rejects_file_with_helpful_message(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    file_path = context.allowed_roots[0] / "single.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("list_allowed_directory")
+
+    with pytest.raises(Exception, match="use /read <path> instead"):
+        spec.handler(spec.input_model(path=str(file_path)), context)
+
+
+def test_list_allowed_directory_rejects_missing_path_with_helpful_message(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("list_allowed_directory")
+
+    with pytest.raises(Exception, match="does not exist"):
+        spec.handler(spec.input_model(path=str(context.allowed_roots[0] / "missing")), context)
 
 
 def test_take_note_writes_under_notes_dir(tmp_path: Path) -> None:
@@ -262,3 +293,123 @@ def test_run_repo_command_uses_linux_defaults(tmp_path: Path, monkeypatch) -> No
 
     assert result["ok"] is True
     assert captured["argv"] == ["python3", "-m", "pytest", "-q"]
+
+
+def test_run_shell_command_executes_command(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("run_shell_command")
+
+    result = spec.handler(
+        spec.input_model(command="printf 'hello-shell'", workdir=str(tmp_path)),
+        context,
+    )
+
+    assert result["ok"] is True
+    assert result["stdout"] == "hello-shell"
+
+
+def test_find_paths_matches_case_insensitive_directories(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("find_paths")
+    nested_dir = context.allowed_roots[0] / "Projects" / "hilTest"
+    nested_dir.mkdir(parents=True)
+
+    result = spec.handler(
+        spec.input_model(pattern="hiltest", start_path=str(context.allowed_roots[0]), directories_only=True),
+        context,
+    )
+
+    assert result["matches"] == [{"path": str(nested_dir), "is_dir": True}]
+
+
+def test_inspect_project_detects_python_project_and_suggests_commands(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("inspect_project")
+    project_dir = context.allowed_roots[0] / "hilTest"
+    project_dir.mkdir()
+    (project_dir / "pyproject.toml").write_text("[project]\nname='hiltest'\n", encoding="utf-8")
+    (project_dir / "README.md").write_text("# hilTest\n", encoding="utf-8")
+
+    result = spec.handler(spec.input_model(path=str(project_dir)), context)
+
+    assert result["path"] == str(project_dir)
+    assert "python" in result["detected_types"]
+    assert "pyproject.toml" in result["entry_names"]
+    assert "python3 -m pytest -q" in result["suggested_commands"]
+    assert result["readme_path"] == str(project_dir / "README.md")
+
+
+def test_inspect_project_detects_script_bundle_and_entrypoints(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("inspect_project")
+    project_dir = context.allowed_roots[0] / "hilTest"
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (project_dir / ".venv").mkdir()
+    (project_dir / "run.log").write_text("started\n", encoding="utf-8")
+    (project_dir / "run.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (scripts_dir / "startRoutingService.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (scripts_dir / "start.py").write_text("print('hi')\n", encoding="utf-8")
+
+    result = spec.handler(spec.input_model(path=str(project_dir)), context)
+
+    assert "script_bundle" in result["detected_types"]
+    assert "python_environment" in result["detected_types"]
+    assert result["likely_entrypoints"][0] == "scripts/startRoutingService.sh"
+    assert "scripts/start.py" in result["likely_entrypoints"]
+    assert "run.log" not in result["likely_entrypoints"]
+    assert result["suggested_commands"][0] == "source .venv/bin/activate"
+    assert any(command.startswith("bash run.sh") for command in result["suggested_commands"])
+    assert any(command.startswith("bash scripts/startRoutingService.sh") for command in result["suggested_commands"])
+
+
+def test_project_map_returns_tree_and_project_insights(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("project_map")
+    project_dir = context.allowed_roots[0] / "demo"
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (project_dir / "README.md").write_text("# demo\n", encoding="utf-8")
+    (scripts_dir / "run.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    result = spec.handler(spec.input_model(path=str(project_dir), max_depth=2, max_entries=50), context)
+
+    assert result["path"] == str(project_dir)
+    assert "script_bundle" in result["detected_types"]
+    assert "scripts/run.sh" in result["likely_entrypoints"]
+    assert any(line == "scripts/" for line in result["tree"])
+
+
+def test_patch_file_replaces_exact_snippet(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("patch_file")
+    file_path = context.allowed_roots[0] / "script.sh"
+    file_path.write_text("echo old\n", encoding="utf-8")
+
+    result = spec.handler(
+        spec.input_model(path=str(file_path), old_text="echo old", new_text="echo new"),
+        context,
+    )
+
+    assert result["replacements"] == 1
+    assert file_path.read_text(encoding="utf-8") == "echo new\n"
+
+
+def test_patch_file_requires_unique_match_unless_replace_all(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("patch_file")
+    file_path = context.allowed_roots[0] / "script.sh"
+    file_path.write_text("echo old\necho old\n", encoding="utf-8")
+
+    with pytest.raises(Exception, match="matched multiple times"):
+        spec.handler(
+            spec.input_model(path=str(file_path), old_text="echo old", new_text="echo new"),
+            context,
+        )

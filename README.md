@@ -137,6 +137,8 @@ cd /home/pi/privateAgent
 
 The original PowerShell scripts are still available for legacy Windows setups, but the Linux shell scripts are now the primary path for Linux hosts and Raspberry Pi.
 
+For a Raspberry Pi setup where the agent should be able to read and list files anywhere on the local filesystem, set `PRIVATE_AGENT_ALLOWED_ROOTS=/`.
+
 ## DeepSeek Cloud Mode
 
 To use DeepSeek official API:

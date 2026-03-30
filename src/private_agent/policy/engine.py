@@ -31,5 +31,10 @@ class PolicyEngine:
                 reason="tool policy requires explicit confirmation",
             )
         if tool.risk_level == "high":
-            return PolicyDecision(state="deny", reason="high-risk tools are disabled in MVP")
+            if self._safe_mode:
+                return PolicyDecision(
+                    state="allow_with_confirmation",
+                    reason="safe_mode requires confirmation for high-risk tools",
+                )
+            return PolicyDecision(state="allow", reason="high-risk tool allowed because safe_mode is off")
         return PolicyDecision(state="allow", reason="tool allowed")
