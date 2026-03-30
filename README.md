@@ -1,55 +1,67 @@
 # Private Agent
 
-`privateAgent` is a local-first Telegram bot for remote monitoring and low-risk machine interaction.
+`privateAgent` is a local-first Telegram bot for remote monitoring, controlled local execution, and cloud-assisted planning.
 
-Right now it is intentionally narrow:
+The project is intentionally narrow and safe by default:
 
 - Telegram polling transport
 - allowlisted sender and chat verification
-- safe read-only monitoring tools
-- a simple note-writing tool
-- audit and state storage
-- no arbitrary remote shell execution
-- DeepSeek cloud planning support
+- safe monitoring tools
+- DeepSeek cloud planning and summary support
+- local knowledge-base retrieval for durable memory
+- structured audit logs and model call logs
+- no unrestricted remote shell execution
 
-## What This Bot Can Do
+## Current Capabilities
 
-The current MVP supports these tool actions:
+The current tool surface includes:
 
-- `ping`: verify the bot is alive
-- `summarize_desktop_status`: return a safe host summary
-- `capture_system_info`: return platform and Python diagnostics
-- `get_system_health`: return uptime, CPU, memory, and system drive health
-- `get_disk_usage`: return all fixed-drive usage
-- `get_top_processes`: return the top local processes by memory usage
-- `get_network_summary`: return active interface information
-- `read_allowed_file`: read a text file under an allowlisted root
-- `list_allowed_directory`: list a directory under an allowlisted root
-- `take_note`: write a markdown note into the configured notes folder
+- `ping`
+- `summarize_desktop_status`
+- `capture_system_info`
+- `get_system_health`
+- `get_disk_usage`
+- `get_top_processes`
+- `get_network_summary`
+- `web_search`
+- `read_allowed_file`
+- `list_allowed_directory`
+- `take_note`
 
-In Telegram, these show up as chat commands:
+Telegram command examples:
 
 - `/ping`
 - `/status`
 - `/health`
 - `/disk`
-- `/processes [limit]`
+- `/processes 10`
 - `/network`
+- `/web <query>`
+- `/inventory`
+- `/inventory milk`
+- `/inventory storage Kitchen`
+- `/inventory box Kitchen | Door`
+- `/inventory set Kitchen | Door | Milk | 2 | Bottle | Drink | Fresh`
+- `/inventory move Kitchen | Milk | Top Shelf`
+- `/inventory delete Kitchen | Milk`
+- `/kb search <query>`
+- `/kb add <path> | <content>`
 - `/tools`
 - `/read <path>`
 - `/list <path>`
 - `/sysinfo`
 - `/note <title> | <body>`
+- `/reset`
 - `/approve <trace_id>`
 - `/cancel <trace_id>`
 
-When `PRIVATE_AGENT_MODEL_BACKEND=deepseek_cloud`, you can also send plain natural-language messages such as:
+When `PRIVATE_AGENT_MODEL_BACKEND=deepseek_cloud`, you can also send natural-language requests such as:
 
 - `现在系统状态如何`
 - `帮我检查一下磁盘空间`
 - `列出当前最占内存的进程`
 
-## First-Time Setup
+## Quick Start
 
 1. Create a virtual environment and install dependencies.
 
@@ -57,33 +69,40 @@ When `PRIVATE_AGENT_MODEL_BACKEND=deepseek_cloud`, you can also send plain natur
 python -m pip install -e .[dev]
 ```
 
-2. Fill in [`.env`](D:/projects/privateAgent/.env).
+2. Fill in [`.env`](D:/projects/privateAgent/.env) using [`.env.example`](D:/projects/privateAgent/.env.example).
 
-Important values:
+Important settings:
 
-- `PRIVATE_AGENT_TELEGRAM_BOT_TOKEN`: your BotFather token
-- `PRIVATE_AGENT_ALLOWED_SENDERS`: Telegram user IDs allowed to control the bot
-- `PRIVATE_AGENT_ALLOWED_CHAT_IDS`: Telegram chat IDs allowed to talk to the bot
-- `PRIVATE_AGENT_ALLOWED_ROOTS`: roots that `/read` and `/list` are allowed to access
-- `PRIVATE_AGENT_NOTES_DIR`: folder used by `/note`
-- `PRIVATE_AGENT_MODEL_BACKEND`: `mock` or `deepseek_cloud`
-- `PRIVATE_AGENT_DEEPSEEK_API_KEY`: required when using `deepseek_cloud`
-- `PRIVATE_AGENT_DEEPSEEK_BASE_URL`: DeepSeek API base URL
-- `PRIVATE_AGENT_DEEPSEEK_MODEL`: cloud model name
-- `PRIVATE_AGENT_MODEL_CALL_LOG_PATH`: where model planning and summary calls are recorded
-- `PRIVATE_AGENT_ENABLE_NETWORK_TOOLS`: must be `true` for `/network`
+- `PRIVATE_AGENT_TELEGRAM_BOT_TOKEN`
+- `PRIVATE_AGENT_ALLOWED_SENDERS`
+- `PRIVATE_AGENT_ALLOWED_CHAT_IDS`
+- `PRIVATE_AGENT_ALLOWED_ROOTS`
+- `PRIVATE_AGENT_NOTES_DIR`
+- `PRIVATE_AGENT_KNOWLEDGE_BASE_DIR`
+- `PRIVATE_AGENT_AUDIT_LOG_PATH`
+- `PRIVATE_AGENT_MODEL_CALL_LOG_PATH`
+- `PRIVATE_AGENT_MODEL_BACKEND`
+- `PRIVATE_AGENT_DEEPSEEK_API_KEY`
+- `PRIVATE_AGENT_DEEPSEEK_BASE_URL`
+- `PRIVATE_AGENT_DEEPSEEK_MODEL`
+- `PRIVATE_AGENT_ENABLE_NETWORK_TOOLS`
+- `PRIVATE_AGENT_ENABLE_WEB_SEARCH`
+- `PRIVATE_AGENT_WEB_SEARCH_ALLOWED_DOMAINS`
+- `PRIVATE_AGENT_WEB_SEARCH_MAX_RESULTS`
+- `PRIVATE_AGENT_CONVERSATION_HISTORY_MESSAGES`
+- `PRIVATE_AGENT_KNOWLEDGE_MAX_SNIPPETS`
+- `PRIVATE_AGENT_ENABLE_INVENTORY_SYNC`
+- `PRIVATE_AGENT_INVENTORY_SYNC_BIND_HOST`
+- `PRIVATE_AGENT_INVENTORY_SYNC_PORT`
+- `PRIVATE_AGENT_INVENTORY_SYNC_TOKEN`
+- `PRIVATE_AGENT_INVENTORY_SYNC_DIR`
 
-3. If you do not know your Telegram IDs yet:
-
-- send any message to your bot
-- run:
+3. If you do not know your Telegram IDs yet, send any message to the bot and run:
 
 ```powershell
 $env:PYTHONPATH='src'
 python -m private_agent.bootstrap_telegram
 ```
-
-- copy the printed `sender_id` and `chat_id` into [`.env`](D:/projects/privateAgent/.env)
 
 4. Optional but recommended: run tests.
 
@@ -91,40 +110,50 @@ python -m private_agent.bootstrap_telegram
 python -m pytest
 ```
 
-## Using The Bot
+## Running The Bot
 
-Once the bot is running, open your bot in Telegram and send commands like:
+### Foreground
 
-```text
-/ping
-/status
-/health
-/disk
-/processes 10
-/network
-/tools
-/sysinfo
-/list D:\projects\privateAgent\data\allowed
+```powershell
+cd D:\projects\privateAgent
+$env:PYTHONPATH='src'
+python -m private_agent.run_telegram
 ```
 
-Notes about access:
+Stop with `Ctrl+C`.
 
-- `/read` and `/list` only work under `PRIVATE_AGENT_ALLOWED_ROOTS`
-- the bot only responds to users and chats listed in `.env`
-- `/network` only works when `PRIVATE_AGENT_ENABLE_NETWORK_TOOLS=true`
-- when `PRIVATE_AGENT_MODEL_BACKEND=deepseek_cloud`, plain natural-language messages can be planned by DeepSeek and executed locally through safe typed tools
-- successful Telegram replies now show user-facing answers only; internal `status` and `trace_id` are kept in logs instead of chat
-- if DeepSeek replies with `HTTP 402` or `Insufficient Balance`, your API account needs billing or credits before model mode will work
+If inventory sync is enabled, the Telegram process also starts an HTTP sync server at:
 
-## Cloud DeepSeek
+```text
+http://<bind-host>:<port>/inventory/sync
+```
 
-The cloud DeepSeek backend is now wired into the main natural-language flow.
+### Background
 
-- backend interface lives under [`models`](D:/projects/privateAgent/src/private_agent/models)
-- mock backend remains the default
-- cloud backend implementation is in [`deepseek_cloud.py`](D:/projects/privateAgent/src/private_agent/models/deepseek_cloud.py)
+Start:
 
-To use the cloud backend, set:
+```powershell
+cd D:\projects\privateAgent
+powershell -ExecutionPolicy Bypass -File .\scripts\start_telegram_bot.ps1
+```
+
+Stop:
+
+```powershell
+cd D:\projects\privateAgent
+powershell -ExecutionPolicy Bypass -File .\scripts\stop_telegram_bot.ps1
+```
+
+Status:
+
+```powershell
+cd D:\projects\privateAgent
+powershell -ExecutionPolicy Bypass -File .\scripts\status_telegram_bot.ps1
+```
+
+## DeepSeek Cloud Mode
+
+To use DeepSeek official API:
 
 ```powershell
 PRIVATE_AGENT_MODEL_BACKEND=deepseek_cloud
@@ -134,105 +163,104 @@ PRIVATE_AGENT_DEEPSEEK_MODEL=deepseek-chat
 PRIVATE_AGENT_MODEL_CALL_LOG_PATH=D:\projects\privateAgent\data\model_calls.log
 ```
 
-How the flow works now:
+How the natural-language flow works:
 
-- Telegram receives your natural-language request
-- DeepSeek produces a structured plan
-- the local policy layer validates that plan
-- the local executor runs only typed safe tools
-- DeepSeek summarizes the tool results
-- Telegram sends back only the final answer text
+- Telegram receives your request
+- local knowledge-base retrieval finds relevant durable memory from disk
+- DeepSeek produces a structured plan using chat state plus retrieved knowledge
+- the local policy layer validates the plan
+- the local executor runs only typed local tools
+- DeepSeek summarizes only trusted local tool results
+- Telegram shows only the final user-facing answer
 
-## Seeing Model Thinking
+Conversation memory:
 
-If you want to inspect what DeepSeek planned, read:
+- each Telegram chat keeps a short rolling history for follow-up questions
+- the default history window is controlled by `PRIVATE_AGENT_CONVERSATION_HISTORY_MESSAGES`
+- use `/reset` to clear the current chat's conversation memory
+- the agent also keeps a compact session state with active goal, recent tool usage, and working-memory summaries so follow-up requests do not start from zero
 
-```powershell
-Get-Content .\data\model_calls.log -Tail 5
-```
+Knowledge base:
 
-Or follow it live:
+- drop markdown, text, or json documents into `PRIVATE_AGENT_KNOWLEDGE_BASE_DIR`
+- the agent retrieves relevant snippets on each natural-language turn
+- retrieved snippets are treated as trusted local memory for planning
+- this is the long-term memory layer; conversation history is only the short-term layer
+- `PRIVATE_AGENT_KNOWLEDGE_MAX_SNIPPETS` controls how many snippets are injected per turn
+- use `/kb search <query>` to inspect what the agent can currently retrieve
+- use `/kb add <path> | <content>` to append durable notes from Telegram
 
-```powershell
-Get-Content .\data\model_calls.log -Wait
-```
+## Inventory Sync
 
-Each entry records:
+`privateAgent` can now act as the Raspberry Pi inventory sync hub for the Android app.
 
-- `kind`: `plan` or `summarize`
-- `request_messages`
-- `available_tools`
-- `raw_content`: the model's raw output
-- `reasoning_content`: present when the model/provider returns it
-- `parsed_plan`: the structured plan extracted locally
-- `status`
+What it does:
 
-Important note:
+- receives full inventory snapshots from the phone
+- stores the latest snapshot in `PRIVATE_AGENT_INVENTORY_SYNC_DIR/current_inventory.json`
+- mirrors the latest snapshot into the knowledge base under `projects/fridge-system/`
+- keeps a queue of Telegram-originated inventory mutations
+- serves pending changes back to the phone through `/inventory/sync`
 
-- `deepseek-chat` often does not expose full reasoning text
-- if you want richer reasoning traces later, switch to a reasoning-capable model or DeepSeek thinking mode
+Conflict model:
 
-## Start The Remote Monitoring Service
+- phone data is authoritative when timestamps conflict
+- Telegram-originated changes are queued once on the Pi
+- the phone acknowledges the highest applied change sequence after it syncs back
+- acknowledged changes are removed from the queue
+- this avoids endless back-and-forth sync loops
 
-This project uses a Telegram polling process as the remote monitoring service.
-
-### Start in the foreground
-
-Use this when you want to watch logs directly in the current terminal:
-
-```powershell
-cd D:\projects\privateAgent
-$env:PYTHONPATH='src'
-python -m private_agent.run_telegram
-```
-
-Press `Ctrl+C` to stop it.
-
-### Start in the background
-
-Use this for normal day-to-day use:
+Suggested `.env` settings:
 
 ```powershell
-cd D:\projects\privateAgent
-powershell -ExecutionPolicy Bypass -File .\scripts\start_telegram_bot.ps1
+PRIVATE_AGENT_ENABLE_INVENTORY_SYNC=true
+PRIVATE_AGENT_INVENTORY_SYNC_BIND_HOST=0.0.0.0
+PRIVATE_AGENT_INVENTORY_SYNC_PORT=8765
+PRIVATE_AGENT_INVENTORY_SYNC_TOKEN=replace_with_your_token
+PRIVATE_AGENT_INVENTORY_SYNC_DIR=D:\projects\privateAgent\data\inventory_sync
 ```
 
-This script:
+Telegram inventory commands:
 
-- starts the bot as a background Python process
-- writes the PID to `data\telegram_bot.pid`
-- writes logs to `logs\telegram_bot.out.log` and `logs\telegram_bot.err.log`
+- `/inventory`
+  Shows the latest synced inventory summary.
+- `/inventory <query>`
+  Filters the latest inventory snapshot by item name or location text.
+- `/inventory storage <storage>`
+  Creates a storage space.
+- `/inventory box <storage> | <box>`
+  Creates a box inside a storage space.
+- `/inventory set <storage> | <box> | <item> | <quantity> | <unit> | [category] | [note]`
+  Creates or updates an item.
+- `/inventory move <storage> | <item> | <target_box>`
+  Moves an item to another box in the same storage.
+- `/inventory delete <storage> | <item>`
+  Deletes an item.
 
-## Stop The Remote Monitoring Service
+Suggested knowledge structure:
 
-If the bot was started in the foreground, stop it with `Ctrl+C`.
+- `data/knowledge/profile/`
+- `data/knowledge/projects/`
+- `data/knowledge/procedures/`
+- `data/knowledge/references/`
 
-If the bot was started in the background, stop it with:
+Starter templates created in the repo:
 
-```powershell
-cd D:\projects\privateAgent
-powershell -ExecutionPolicy Bypass -File .\scripts\stop_telegram_bot.ps1
-```
+- `D:\projects\privateAgent\data\knowledge\README.md`
+- `D:\projects\privateAgent\data\knowledge\profile\user-preferences.md`
+- `D:\projects\privateAgent\data\knowledge\projects\project-template.md`
+- `D:\projects\privateAgent\data\knowledge\procedures\procedure-template.md`
+- `D:\projects\privateAgent\data\knowledge\references\environment-notes.md`
 
-The stop script first checks `data\telegram_bot.pid`, and if needed it also searches for a matching `python -m private_agent.run_telegram` process.
+Web search safety boundary:
 
-## Check Remote Monitoring Service Status
+- `web_search` uses DuckDuckGo result pages only
+- it does not fetch the destination pages behind results
+- search snippets are treated as untrusted external content
+- external search content is never fed back into DeepSeek summary prompts
+- if a natural-language request uses `web_search`, the final reply is formatted locally instead of asking the model to summarize those results
 
-To see whether the Telegram monitoring service is currently running, use:
-
-```powershell
-cd D:\projects\privateAgent
-powershell -ExecutionPolicy Bypass -File .\scripts\status_telegram_bot.ps1
-```
-
-This prints:
-
-- whether the bot is running or stopped
-- the current PID when running
-- the process start time
-- whether the PID file exists
-- where stdout and stderr logs are stored
-- the tail of stderr when there are recent errors
+If DeepSeek returns `HTTP 402` or `Insufficient Balance`, the API account needs credits or billing.
 
 ## Logs And Runtime Files
 
@@ -242,9 +270,80 @@ This prints:
 - audit log: [`data/audit.log`](D:/projects/privateAgent/data/audit.log)
 - model call log: [`data/model_calls.log`](D:/projects/privateAgent/data/model_calls.log)
 - state store: [`data/state.json`](D:/projects/privateAgent/data/state.json)
+- knowledge directory: [`data/knowledge`](D:/projects/privateAgent/data/knowledge)
 
-These runtime files may not exist until the bot has been started at least once.
+Notes:
 
-## Repo Notes
+- `audit.log` records handled requests, tool calls, and policy outcomes
+- `model_calls.log` records model planning and summary calls
+- plan records may include `session_context`, including retrieved knowledge snippets
+- successful Telegram replies hide internal `status` and `trace_id`
+- web-search results may appear in the Telegram reply, but they are not replayed into model reasoning context
 
-See [AGENTS.md](D:/projects/privateAgent/AGENTS.md) and the docs folder for the original implementation scope, architecture, and safety constraints.
+## Seeing Model Thinking
+
+To inspect recent model calls:
+
+```powershell
+Get-Content .\data\model_calls.log -Tail 5
+```
+
+To follow model calls live:
+
+```powershell
+Get-Content .\data\model_calls.log -Wait
+```
+
+Each model log record may include:
+
+- `kind`
+- `request_messages`
+- `available_tools`
+- `raw_content`
+- `reasoning_content`
+- `parsed_plan`
+- `status`
+
+Important note:
+
+- `deepseek-chat` may not expose full reasoning text
+- richer reasoning traces may require a reasoning-capable model or DeepSeek thinking mode
+
+## Remote Programming Direction
+
+The long-term goal is to support remote programming over Telegram, but not by exposing arbitrary shell access.
+
+Recommended design:
+
+- work only inside allowlisted repositories
+- bind each session to one active repository
+- allow only named repo commands from a command registry
+- allow safe repo tools such as read, search, diff, test, commit, and push
+- require confirmation for destructive or externalizing actions
+
+This project should not expose raw PowerShell, CMD, or Bash directly from chat input.
+
+Planned remote development tool categories:
+
+- `list_repo_dir`
+- `read_repo_file`
+- `search_repo`
+- `write_repo_patch`
+- `run_repo_command`
+- `show_repo_diff`
+- `git_commit_repo`
+- `git_push_repo`
+
+## Security Notes
+
+- `.env`, logs, and runtime state should remain out of git
+- secrets should stay local and should not be sent to the cloud model by default
+- all side-effecting actions should be confirmation-aware
+- remote development should be repo-safe, not system-wide
+
+## More Docs
+
+- [Architecture](D:/projects/privateAgent/docs/architecture.md)
+- [Security](D:/projects/privateAgent/docs/security.md)
+- [Threat Model](D:/projects/privateAgent/docs/threat-model.md)
+- [Project Instructions](D:/projects/privateAgent/AGENTS.md)

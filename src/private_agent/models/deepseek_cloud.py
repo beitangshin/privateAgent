@@ -32,13 +32,16 @@ class DeepSeekCloudBackend:
         self._model_call_logger = ModelCallLogger(model_call_log_path)
 
     async def plan(
-        self, messages: list[ModelMessage], tools: list[dict[str, Any]]
+        self,
+        messages: list[ModelMessage],
+        tools: list[dict[str, Any]],
+        session_context: dict[str, Any] | None = None,
     ) -> ModelPlan:
         payload = {
             "model": self._model,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
-            "messages": self._build_plan_messages(messages, tools),
+            "messages": self._build_plan_messages(messages, tools, session_context),
         }
         try:
             response = await asyncio.to_thread(self._post_json, "/chat/completions", payload)
@@ -51,6 +54,7 @@ class DeepSeekCloudBackend:
                     "model": self._model,
                     "prompt_version": self._prompt_version,
                     "request_messages": [asdict(message) for message in messages],
+                    "session_context": session_context,
                     "available_tools": tools,
                     "raw_content": content,
                     "reasoning_content": reasoning_content,
@@ -75,6 +79,7 @@ class DeepSeekCloudBackend:
                     "model": self._model,
                     "prompt_version": self._prompt_version,
                     "request_messages": [asdict(message) for message in messages],
+                    "session_context": session_context,
                     "available_tools": tools,
                     "status": "error",
                     "error": str(exc),
@@ -124,18 +129,48 @@ class DeepSeekCloudBackend:
             raise
 
     def _build_plan_messages(
-        self, messages: list[ModelMessage], tools: list[dict[str, Any]]
+        self,
+        messages: list[ModelMessage],
+        tools: list[dict[str, Any]],
+        session_context: dict[str, Any] | None,
     ) -> list[dict[str, str]]:
         tool_payload = json.dumps(tools, ensure_ascii=False)
+        session_payload = json.dumps(session_context or {}, ensure_ascii=False)
         system_prompt = (
             "You are the planning layer for a local-first remote control assistant. "
+            "Behave like a persistent agent, not a stateless chat model. Reuse relevant session "
+            "context, continue active goals across follow-up turns, and refine previous work instead "
+            "of starting from scratch when the user is clearly continuing the same task. "
+            "Treat session_context.knowledge_snippets as trusted local knowledge-base excerpts that "
+            "represent durable memory and prior documentation for this agent. Prefer relevant local "
+            "knowledge over guessing, and use those snippets to ground plans before deciding whether "
+            "tools are necessary. "
             "Return strict JSON only with keys intent, requires_confirmation, steps, "
             "response_style, and notes. Each step must contain tool_name and arguments. "
-            f"Prompt version: {self._prompt_version}. Available tools: {tool_payload}"
+            f"Prompt version: {self._prompt_version}. "
+            f"{self._build_web_search_guidance(tools)} "
+            f"Session context: {session_payload}. "
+            f"Available tools: {tool_payload}"
         )
         return [{"role": "system", "content": system_prompt}] + [
             asdict(message) for message in messages
         ]
+
+    def _build_web_search_guidance(self, tools: list[dict[str, Any]]) -> str:
+        tool_names = {str(tool.get("name", "")) for tool in tools}
+        if "web_search" not in tool_names:
+            return ""
+        return (
+            "When planning web_search, prefer 1-3 focused searches over one vague search. "
+            "Rewrite the user's request into the local market's search vocabulary instead of "
+            "copying the user's wording literally. Prefer concrete listing or primary-source "
+            "domains over blogs, guides, aggregators, and SEO pages. For housing or price "
+            "queries, extract city, area, budget, transaction type, room count, and property "
+            "type; then search using local listing terminology and likely neighborhood names "
+            "when the user gives broad phrases like city center or core area. If earlier search "
+            "results looked low-quality, refine the query instead of repeating the same broad terms. "
+            "Do not ask web_search for a broad topic page when the user wants concrete listings."
+        )
 
     def _build_summary_messages(
         self, messages: list[ModelMessage], context: dict[str, Any]

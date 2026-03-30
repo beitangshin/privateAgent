@@ -2,7 +2,7 @@
 
 ## Current Direction
 
-`privateAgent` will use a split architecture:
+`privateAgent` uses a split architecture:
 
 - a cloud-hosted DeepSeek model as the control brain
 - a local Telegram bot as the trusted execution agent
@@ -30,8 +30,10 @@ Telegram
        -> Local Tool Runtime
             -> Read-only monitoring tools
             -> Controlled write tools
+            -> Repo-safe development tools
             -> Optional automation tools
   -> Local Audit Logger
+  -> Local Model Call Logger
   -> Local State Store
   -> Telegram Reply
 ```
@@ -69,7 +71,7 @@ The local bot is responsible for:
 
 This means the local machine remains the final authority.
 
-## Recommended Request Flow
+## Request Flows
 
 ### Low-risk command flow
 
@@ -107,7 +109,36 @@ Telegram message
   -> Telegram response
 ```
 
-This is the main future path for cloud-assisted control.
+### Repo development flow
+
+Use this for controlled remote programming tasks.
+
+Examples:
+
+- "show me the diff in FridgeSystem"
+- "search for FoodItemDao usage"
+- "run tests in privateAgent"
+- "open the README for FridgeSystem"
+
+```text
+Telegram message
+  -> Local auth
+  -> Repo session selector
+  -> DeepSeek structured repo plan
+  -> Local repo policy validation
+  -> Repo-safe tool runtime
+       -> read_repo_file
+       -> search_repo
+       -> list_repo_dir
+       -> run_repo_command
+       -> show_repo_diff
+       -> git_commit (confirmation)
+       -> git_push (confirmation)
+  -> Audit log
+  -> Telegram response
+```
+
+This is the recommended path for "remote coding" without exposing arbitrary shell access.
 
 ## Planning Contract
 
@@ -142,7 +173,7 @@ Local code should reject:
 
 ## Core Local Modules
 
-The existing module layout still fits this architecture:
+The current module layout supports this architecture:
 
 ```text
 transport  -> Telegram message normalization
@@ -151,35 +182,69 @@ policy     -> risk, allow/deny, confirmation rules
 agent      -> orchestration and planning flow
 models     -> DeepSeek backend abstraction
 executor   -> typed tool execution runtime
-tools      -> local capabilities only
-audit      -> structured logs
+tools      -> monitoring and safe local capabilities
+audit      -> structured logs and model call logs
 storage    -> state, approvals, job metadata
 config     -> environment-driven settings
 ```
 
-## Suggested Model Layer Extension
+Future remote development support should add:
 
-The `models` package should evolve into two explicit backends:
-
-- `mock.py`: local tests and development
-- `deepseek_cloud.py`: cloud planner backend
-
-Recommended interface:
-
-```python
-class ModelBackend(Protocol):
-    async def plan(self, messages: list[dict], tools: list[dict]) -> ModelPlan:
-        ...
-
-    async def summarize(self, messages: list[dict], context: dict) -> str:
-        ...
+```text
+repo       -> repository registry, repo session state, repo command allowlists
 ```
 
-Why split `plan` and `summarize`:
+## Repo-Safe Development Mode
 
-- planning needs strict structured output
-- summarization can stay freer and more natural
-- it is easier to audit which model call caused which tool execution
+This project should not expose raw shell execution from Telegram.
+
+Instead, remote development should be modeled as a restricted capability layer.
+
+### Required constraints
+
+- operations are limited to allowlisted repositories
+- each Telegram session is bound to one active repository
+- commands are selected from an allowlisted command registry
+- file edits are restricted to repo roots
+- dangerous git commands require confirmation or are denied
+- system directories remain inaccessible
+
+### Recommended repo tool set
+
+- `list_repo_dir`
+- `read_repo_file`
+- `search_repo`
+- `write_repo_patch`
+- `run_repo_command`
+- `show_repo_diff`
+- `git_commit_repo`
+- `git_push_repo`
+
+### Example repo command registry
+
+Use named commands, not free-form shell text.
+
+```json
+{
+  "pytest": {
+    "argv": ["python", "-m", "pytest"],
+    "allowed_extra_args": ["-q", "-k", "tests/test_agent_flow.py"],
+    "timeout_sec": 120
+  },
+  "gradle_test": {
+    "argv": ["gradlew.bat", "test"],
+    "allowed_extra_args": [],
+    "timeout_sec": 300
+  },
+  "git_status": {
+    "argv": ["git", "status", "--short", "--branch"],
+    "allowed_extra_args": [],
+    "timeout_sec": 30
+  }
+}
+```
+
+The key is that the model chooses a command ID, not an arbitrary command string.
 
 ## Security Boundary
 
@@ -193,6 +258,7 @@ Mandatory rules:
 - dangerous tools require local confirmation even if the model insists otherwise
 - local policy can deny any plan regardless of model confidence
 - local safe mode can disable entire tool categories
+- repo development mode must never imply unrestricted system shell access
 
 ## Data Minimization Strategy
 
@@ -209,7 +275,7 @@ Examples:
 
 - for log triage, send the last 50 relevant lines, not the whole file
 - for file inspection, send path, size, and a bounded excerpt
-- for health checks, send structured metrics instead of verbose dumps
+- for repo debugging, send just the relevant file snippet, not the entire repository
 
 ## Observability
 
@@ -220,7 +286,7 @@ To make cloud-assisted control debuggable, log both sides of the flow.
 - trace ID
 - Telegram sender and chat
 - original user message
-- whether the request was command-mode or model-mode
+- whether the request was command-mode, model-mode, or repo-dev-mode
 - model backend used
 - model plan summary
 - local policy decision
@@ -236,11 +302,20 @@ To make cloud-assisted control debuggable, log both sides of the flow.
 - model name
 - prompt template version
 - sanitized request payload
+- raw model output
+- reasoning content when available
 - structured plan returned
-- latency
 - parse failures
 
-This should live separately from the general tool audit trail.
+### Repo execution log should record
+
+- active repository
+- chosen command ID
+- approved extra arguments
+- working directory
+- exit code
+- stdout/stderr summary
+- whether confirmation was required
 
 ## Recommended Runtime Modes
 
@@ -250,48 +325,48 @@ Support these modes explicitly:
 - `cloud_plan_local_execute`: cloud DeepSeek plans, local bot executes
 - `confirmation_only`: any side-effecting tool requires approval
 - `safe_mode`: deny risky categories entirely
+- `repo_dev_mode`: allow repo-safe development tools only inside allowlisted repositories
 
 For your use case, the best default is:
 
 - `cloud_plan_local_execute`
-- plus `safe_mode=true` at first
+- plus `safe_mode=true`
+- plus `repo_dev_mode` only when explicitly enabled
 
 ## Practical Rollout Plan
 
 ### Phase A
 
-Keep the current command bot working and add richer monitoring tools.
-
-Good next tools:
-
-- `get_system_health`
-- `get_disk_usage`
-- `get_top_processes`
-- `get_network_summary`
+Keep the current command bot working and maintain rich monitoring tools.
 
 ### Phase B
 
-Add the cloud DeepSeek planner backend without any write-capable tools.
-
-Allowed first use cases:
-
-- summarize system health
-- explain logs
-- choose which safe read-only tools to call
+Use DeepSeek for read-only natural-language planning and summary generation.
 
 ### Phase C
 
-Add confirmation-aware write tools.
+Add repo-safe development tools with strict repo and command allowlists.
 
-Examples:
+Allowed first use cases:
 
-- `write_note`
-- `archive_file`
-- `run_preapproved_task`
+- read files in an allowlisted repo
+- search code
+- run tests
+- inspect git status and diff
 
 ### Phase D
 
-Only then consider automation tools such as browser or desktop control.
+Add confirmation-aware write tools for repository changes.
+
+Examples:
+
+- write a patch
+- commit changes
+- push changes
+
+### Phase E
+
+Only then consider broader automation.
 
 ## Recommendation
 
@@ -302,5 +377,6 @@ For this project, the strongest architecture is:
 - DeepSeek in the cloud acts as planner and explainer
 - local policy remains the real gatekeeper
 - all execution stays inside typed audited local tools
+- remote programming is implemented as repo-safe tooling, not arbitrary shell
 
 That gives you the convenience of a stronger remote brain without giving up control of the machine.

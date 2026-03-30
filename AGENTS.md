@@ -621,6 +621,3 @@ When uncertain, choose the option that is:
 5. more modular for later replacement
 
 Build a system that is useful on day one, but still trustworthy when it gains more power later.
-
-
-TelegramToken：8635441235:AAFA_rznD4MNrrahXVprYRhnbbrjhv3SkNI

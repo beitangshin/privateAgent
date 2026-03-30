@@ -38,7 +38,10 @@ class ModelResponse:
 
 class ModelBackend(Protocol):
     async def plan(
-        self, messages: list[ModelMessage], tools: list[dict[str, Any]]
+        self,
+        messages: list[ModelMessage],
+        tools: list[dict[str, Any]],
+        session_context: dict[str, Any] | None = None,
     ) -> ModelPlan:
         ...
 
