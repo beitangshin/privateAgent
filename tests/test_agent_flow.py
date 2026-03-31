@@ -148,6 +148,19 @@ async def test_natural_language_requires_confirmation_for_note(tmp_path: Path) -
 
 
 @pytest.mark.anyio
+async def test_natural_language_query_requires_tool_backed_plan(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service._model_backend = FakeModelBackend(steps=[], notes="the machine looks fine")
+    message = _message()
+    message.text = "帮我查一下系统状态"
+
+    result = await service.handle_natural_language(message)
+
+    assert result.status == "error"
+    assert "must be backed by at least one local tool step" in result.message
+
+
+@pytest.mark.anyio
 async def test_natural_language_never_sends_web_results_back_to_model(tmp_path: Path) -> None:
     service = _service(tmp_path)
     fake_backend = FakeModelBackend(
@@ -256,7 +269,7 @@ Safety notice: external search results were returned directly and were not fed b
 @pytest.mark.anyio
 async def test_agent_session_tracks_active_goal_across_follow_up(tmp_path: Path) -> None:
     service = _service(tmp_path)
-    fake_backend = FakeModelBackend(steps=[])
+    fake_backend = FakeModelBackend(steps=[ModelPlanStep(tool_name="ping", arguments={})])
     service._model_backend = fake_backend
 
     first = _message()

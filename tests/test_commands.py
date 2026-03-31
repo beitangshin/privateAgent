@@ -28,6 +28,11 @@ def test_parse_health_command() -> None:
     assert parsed.args == {}
 
 
+def test_parse_version_command() -> None:
+    parsed = parse_command("/version")
+    assert parsed.kind == "version"
+
+
 def test_parse_inventory_command() -> None:
     parsed = parse_command("/inventory milk")
     assert parsed.kind == "tool"

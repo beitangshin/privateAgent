@@ -5,9 +5,55 @@ import json
 
 from private_agent.app import build_app
 from private_agent.config import load_settings
-from private_agent.sync import InventorySyncServer, InventorySyncStore
+from private_agent.sync import InventorySyncServer, InventorySyncStore, MultiPeerInventorySyncStore
 from private_agent.transport.commands import HELP_TEXT, parse_command
 from private_agent.transport.telegram import TelegramBotClient
+
+
+def _format_inventory_snapshot(data: dict[str, object]) -> str | None:
+    if "available" not in data or "storage_count" not in data or "matches" not in data:
+        return None
+
+    if not data.get("available", False):
+        return str(data.get("message", "No synced inventory snapshot is available yet."))
+
+    query = str(data.get("query", "")).strip()
+    matches = data.get("matches", [])
+    if not isinstance(matches, list):
+        matches = []
+
+    if query:
+        if not matches:
+            return f"没有找到“{query}”。"
+        lines = [f"找到了 {len(matches)} 条“{query}”相关库存："]
+    else:
+        storage_count = int(data.get("storage_count", 0))
+        if not matches:
+            return f"当前库存里有 {storage_count} 个存储区，但没有可展示的条目。"
+        lines = [f"当前库存里有 {storage_count} 个存储区，先给你看前 {len(matches)} 条："]
+
+    for entry in matches:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip() or "未命名物品"
+        quantity = entry.get("quantity", "")
+        unit = str(entry.get("unit", "")).strip()
+        storage = str(entry.get("storage", "")).strip()
+        box = str(entry.get("box", "")).strip()
+        category = str(entry.get("category", "")).strip()
+        note = str(entry.get("note", "")).strip()
+
+        detail = f"{name}: {quantity}{unit}"
+        location = " / ".join(part for part in (storage, box) if part)
+        if location:
+            detail += f"，位置 {location}"
+        if category and category != "None":
+            detail += f"，分类 {category}"
+        if note and note != "None":
+            detail += f"，备注 {note}"
+        lines.append(detail)
+
+    return "\n".join(lines)
 
 
 def _format_result_message(result: object) -> str:
@@ -24,6 +70,10 @@ def _format_result_message(result: object) -> str:
             }:
                 return message
             if data is not None:
+                if isinstance(data, dict):
+                    inventory_message = _format_inventory_snapshot(data)
+                    if inventory_message is not None:
+                        return inventory_message
                 return json.dumps(data, ensure_ascii=False, indent=2)
             return message
 
@@ -47,14 +97,22 @@ async def main() -> None:
     service = build_app()
     sync_server: InventorySyncServer | None = None
     if settings.enable_inventory_sync:
+        sync_store = (
+            MultiPeerInventorySyncStore(
+                root=settings.inventory_sync_dir,
+                knowledge_root=settings.knowledge_base_dir,
+            )
+            if settings.inventory_sync_by_source_ip
+            else InventorySyncStore(
+                root=settings.inventory_sync_dir,
+                knowledge_root=settings.knowledge_base_dir,
+            )
+        )
         sync_server = InventorySyncServer(
             host=settings.inventory_sync_bind_host,
             port=settings.inventory_sync_port,
             token=settings.inventory_sync_token,
-            store=InventorySyncStore(
-                root=settings.inventory_sync_dir,
-                knowledge_root=settings.knowledge_base_dir,
-            ),
+            store=sync_store,
         )
         sync_server.start()
     client = TelegramBotClient(
@@ -153,6 +211,9 @@ async def main() -> None:
                         )
                     elif parsed.kind == "reset_conversation":
                         result = service.reset_conversation(update.message)
+                        await client.send_message(update.message.chat_id, _format_result_message(result))
+                    elif parsed.kind == "version":
+                        result = service.get_version(update.message)
                         await client.send_message(update.message.chat_id, _format_result_message(result))
                     elif not update.message.text.strip().startswith("/"):
                         result = await service.handle_natural_language(update.message)

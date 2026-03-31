@@ -28,9 +28,16 @@ The current tool surface includes:
 - `list_allowed_directory`
 - `take_note`
 
+Natural-language query routing:
+
+- DeepSeek now receives an internal query-routing skill before planning
+- for query-style natural-language requests, it is expected to choose at least one read-only tool instead of answering from memory
+- slash commands still bypass DeepSeek and execute locally as before
+
 Telegram command examples:
 
 - `/ping`
+- `/version`
 - `/status`
 - `/health`
 - `/disk`
@@ -98,6 +105,7 @@ Important settings:
 - `PRIVATE_AGENT_INVENTORY_SYNC_PORT`
 - `PRIVATE_AGENT_INVENTORY_SYNC_TOKEN`
 - `PRIVATE_AGENT_INVENTORY_SYNC_DIR`
+- `PRIVATE_AGENT_INVENTORY_SYNC_BY_SOURCE_IP`
 
 3. If you do not know your Telegram IDs yet, send any message to the bot and run:
 
@@ -223,7 +231,15 @@ PRIVATE_AGENT_INVENTORY_SYNC_BIND_HOST=0.0.0.0
 PRIVATE_AGENT_INVENTORY_SYNC_PORT=8765
 PRIVATE_AGENT_INVENTORY_SYNC_TOKEN=replace_with_your_token
 PRIVATE_AGENT_INVENTORY_SYNC_DIR=/home/hil/privateAgent/data/inventory_sync
+PRIVATE_AGENT_INVENTORY_SYNC_BY_SOURCE_IP=false
 ```
+
+Per-IP sync databases:
+
+- when `PRIVATE_AGENT_INVENTORY_SYNC_BY_SOURCE_IP=true`, each syncing client IP gets its own database directory under `PRIVATE_AGENT_INVENTORY_SYNC_DIR/peers/<ip>/`
+- each peer keeps its own `current_inventory.json` and `change_queue.json`
+- `/inventory/sync` automatically routes reads and writes by the request source IP
+- the root-level `current_inventory.json` is still refreshed with the latest synced peer snapshot so existing Telegram inventory reads keep working
 
 Telegram inventory commands:
 

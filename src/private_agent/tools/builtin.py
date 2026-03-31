@@ -16,6 +16,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+from private_agent.sync import load_effective_inventory_snapshot
+
 from .base import ToolContext, ToolError, ToolInputModel, ToolSpec
 
 
@@ -957,14 +959,12 @@ class InventorySnapshotInput(ToolInputModel):
 
 
 def get_inventory_snapshot(data: InventorySnapshotInput, context: ToolContext) -> dict[str, Any]:
-    inventory_file = context.inventory_sync_dir / "current_inventory.json"
-    if not inventory_file.exists():
+    payload = load_effective_inventory_snapshot(context.inventory_sync_dir)
+    if payload is None:
         return {
             "available": False,
             "message": "No synced inventory snapshot is available yet.",
         }
-
-    payload = json.loads(inventory_file.read_text(encoding="utf-8"))
     normalized_query = data.query.strip().lower()
     matches: list[dict[str, Any]] = []
     storages = payload.get("storages", [])

@@ -1,3 +1,13 @@
-from .server import InventorySyncServer, InventorySyncStore
+from .server import (
+    InventorySyncServer,
+    InventorySyncStore,
+    MultiPeerInventorySyncStore,
+    load_effective_inventory_snapshot,
+)
 
-__all__ = ["InventorySyncServer", "InventorySyncStore"]
+__all__ = [
+    "InventorySyncServer",
+    "InventorySyncStore",
+    "MultiPeerInventorySyncStore",
+    "load_effective_inventory_snapshot",
+]

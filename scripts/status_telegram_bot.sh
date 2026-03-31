@@ -22,6 +22,7 @@ if [[ -z "$running_pid" ]]; then
   if [[ -n "$candidate" ]]; then
     running_pid="$candidate"
     pid_source="process_scan"
+    echo "$candidate" >"$pid_file"
   fi
 fi
 
@@ -47,7 +48,15 @@ if [[ -f "$stderr_log" ]]; then
   stderr_size="$(wc -c < "$stderr_log" | tr -d '[:space:]')"
   echo "stderr log bytes: $stderr_size"
   if [[ "$stderr_size" -gt 0 ]]; then
-    echo "Recent stderr:"
-    tail -n 20 "$stderr_log"
+    stderr_epoch="$(stat -c %Y "$stderr_log" 2>/dev/null || echo 0)"
+    pid_epoch="$(stat -c %Y "$pid_file" 2>/dev/null || echo 0)"
+    if [[ "$stderr_epoch" -ge "$pid_epoch" ]]; then
+      echo "Recent stderr:"
+      tail -n 20 "$stderr_log"
+    else
+      echo "Recent stderr: none since last start"
+    fi
+  else
+    echo "Recent stderr: none"
   fi
 fi

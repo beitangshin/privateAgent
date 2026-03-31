@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,10 +31,18 @@ def _normalize_optional(value: str | None) -> str | None:
     return normalized or None
 
 
+def _sanitize_peer_key(value: str) -> str:
+    normalized = value.strip().lower()
+    sanitized = re.sub(r"[^a-z0-9._:-]+", "_", normalized)
+    sanitized = sanitized.strip("._:-")
+    return sanitized or "unknown"
+
+
 @dataclass(slots=True)
 class InventorySyncStore:
     root: Path
     knowledge_root: Path
+    knowledge_relative_dir: Path = Path("projects") / "fridge-system"
 
     @property
     def _inventory_file(self) -> Path:
@@ -80,7 +89,7 @@ class InventorySyncStore:
             "item_count": total_items,
             "latest_change_seq": self.latest_change_seq(),
             "inventory_file": str(self._inventory_file),
-            "knowledge_file": str(self.knowledge_root / "projects" / "fridge-system" / "current_inventory.md"),
+            "knowledge_file": str(self.knowledge_root / self.knowledge_relative_dir / "current_inventory.md"),
         }
 
     def load_snapshot(self) -> dict[str, Any] | None:
@@ -104,6 +113,29 @@ class InventorySyncStore:
     def latest_change_seq(self) -> int:
         state = self._load_change_state()
         return int(state.get("next_seq", 1)) - 1
+
+    def get_changes_for_ip(self, after_seq: int, *, client_ip: str) -> dict[str, Any]:
+        payload = self.get_changes(after_seq)
+        payload["client_ip"] = client_ip
+        payload["peer_key"] = "default"
+        return payload
+
+    def save_snapshot_for_ip(
+        self,
+        payload: dict[str, Any],
+        *,
+        client_ip: str,
+        acknowledged_change_seq: int | None = None,
+        source: str = "android",
+    ) -> dict[str, Any]:
+        summary = self.save_snapshot(
+            payload,
+            acknowledged_change_seq=acknowledged_change_seq,
+            source=source,
+        )
+        summary["client_ip"] = client_ip
+        summary["peer_key"] = "default"
+        return summary
 
     def create_storage(self, storage_name: str) -> dict[str, Any]:
         snapshot = self.load_snapshot() or self._empty_snapshot()
@@ -358,7 +390,7 @@ class InventorySyncStore:
         snapshot["app_version"] = app_version
 
     def _write_knowledge_artifacts(self, payload: dict[str, Any]) -> None:
-        knowledge_dir = self.knowledge_root / "projects" / "fridge-system"
+        knowledge_dir = self.knowledge_root / self.knowledge_relative_dir
         knowledge_dir.mkdir(parents=True, exist_ok=True)
         (knowledge_dir / "current_inventory.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -445,6 +477,239 @@ class InventorySyncStore:
         return None, None
 
 
+@dataclass(slots=True)
+class MultiPeerInventorySyncStore:
+    root: Path
+    knowledge_root: Path
+
+    def __post_init__(self) -> None:
+        self._global_store()._save_change_state({"next_seq": 1, "changes": []})
+
+    def create_storage(self, storage_name: str) -> dict[str, Any]:
+        result = self._global_store().create_storage(storage_name)
+        self._drop_global_change(result["change"])
+        self._replicate_change_to_peers(result["change"])
+        return result
+
+    def create_box(self, storage_name: str, box_name: str) -> dict[str, Any]:
+        result = self._global_store().create_box(storage_name, box_name)
+        self._drop_global_change(result["change"])
+        self._replicate_change_to_peers(result["change"])
+        return result
+
+    def upsert_item(
+        self,
+        *,
+        storage_name: str,
+        box_name: str,
+        item_name: str,
+        quantity: float,
+        unit: str,
+        category: str | None,
+        note: str | None,
+    ) -> dict[str, Any]:
+        result = self._global_store().upsert_item(
+            storage_name=storage_name,
+            box_name=box_name,
+            item_name=item_name,
+            quantity=quantity,
+            unit=unit,
+            category=category,
+            note=note,
+        )
+        self._drop_global_change(result["change"])
+        self._replicate_change_to_peers(result["change"])
+        return result
+
+    def move_item(self, *, storage_name: str, item_name: str, target_box_name: str) -> dict[str, Any]:
+        result = self._global_store().move_item(
+            storage_name=storage_name,
+            item_name=item_name,
+            target_box_name=target_box_name,
+        )
+        self._drop_global_change(result["change"])
+        self._replicate_change_to_peers(result["change"])
+        return result
+
+    def delete_item(self, *, storage_name: str, item_name: str) -> dict[str, Any]:
+        result = self._global_store().delete_item(storage_name=storage_name, item_name=item_name)
+        self._drop_global_change(result["change"])
+        self._replicate_change_to_peers(result["change"])
+        return result
+
+    def get_changes_for_ip(self, after_seq: int, *, client_ip: str) -> dict[str, Any]:
+        peer_key = _sanitize_peer_key(client_ip)
+        payload = self._peer_store(peer_key).get_changes(after_seq)
+        payload["client_ip"] = client_ip
+        payload["peer_key"] = peer_key
+        return payload
+
+    def save_snapshot_for_ip(
+        self,
+        payload: dict[str, Any],
+        *,
+        client_ip: str,
+        acknowledged_change_seq: int | None = None,
+        source: str = "android",
+    ) -> dict[str, Any]:
+        peer_key = _sanitize_peer_key(client_ip)
+        peer_store = self._peer_store(peer_key)
+        summary = peer_store.save_snapshot(
+            payload,
+            acknowledged_change_seq=acknowledged_change_seq,
+            source=source,
+        )
+        latest_snapshot = self._effective_snapshot_for_store(peer_store)
+        if latest_snapshot is not None:
+            self._global_store().save_snapshot(latest_snapshot, source=source)
+        summary["client_ip"] = client_ip
+        summary["peer_key"] = peer_key
+        summary["peer_inventory_file"] = str(peer_store.root / "current_inventory.json")
+        summary["peer_change_queue_file"] = str(peer_store.root / "change_queue.json")
+        return summary
+
+    def _replicate_change_to_peers(self, change: dict[str, Any]) -> None:
+        payload = {
+            key: value
+            for key, value in change.items()
+            if key not in {"seq", "created_at", "created_at_ms"}
+        }
+        for peer_key in self._peer_keys():
+            self._peer_store(peer_key)._append_change(dict(payload))
+
+    def _drop_global_change(self, change: dict[str, Any]) -> None:
+        seq = int(change.get("seq", 0))
+        if seq <= 0:
+            return
+        self._global_store()._prune_acknowledged_changes(seq)
+
+    def _peer_keys(self) -> list[str]:
+        peers_dir = self.root / "peers"
+        if not peers_dir.exists():
+            return []
+        return sorted(
+            child.name
+            for child in peers_dir.iterdir()
+            if child.is_dir()
+        )
+
+    def _effective_snapshot_for_store(self, store: InventorySyncStore) -> dict[str, Any] | None:
+        snapshot = store.load_snapshot()
+        if snapshot is None:
+            return None
+        effective = json.loads(json.dumps(snapshot))
+        state = store._load_change_state()
+        for change in state.get("changes", []):
+            self._apply_change(effective, change)
+        return effective
+
+    def _apply_change(self, snapshot: dict[str, Any], change: dict[str, Any]) -> None:
+        change_type = str(change.get("type", ""))
+        if change_type == "create_storage":
+            self._apply_create_storage(snapshot, str(change.get("storage_name", "")))
+        elif change_type == "create_box":
+            self._apply_create_box(
+                snapshot,
+                str(change.get("storage_name", "")),
+                str(change.get("box_name", "")),
+            )
+        elif change_type == "upsert_item":
+            self._apply_upsert_item(snapshot, change)
+        elif change_type == "move_item":
+            self._apply_move_item(snapshot, change)
+        elif change_type == "delete_item":
+            self._apply_delete_item(snapshot, change)
+        self._global_store()._touch_snapshot(snapshot, app_version="privateAgent")
+
+    def _apply_create_storage(self, snapshot: dict[str, Any], storage_name: str) -> None:
+        global_store = self._global_store()
+        if global_store._find_storage(snapshot, storage_name) is None:
+            snapshot.setdefault("storages", []).append({"name": storage_name, "boxes": [{"name": "Default", "items": []}]})
+
+    def _apply_create_box(self, snapshot: dict[str, Any], storage_name: str, box_name: str) -> None:
+        global_store = self._global_store()
+        storage = global_store._ensure_storage(snapshot, storage_name)
+        if global_store._find_box(storage, box_name) is None:
+            storage.setdefault("boxes", []).append({"name": box_name, "items": []})
+
+    def _apply_upsert_item(self, snapshot: dict[str, Any], change: dict[str, Any]) -> None:
+        global_store = self._global_store()
+        storage = global_store._ensure_storage(snapshot, str(change.get("storage_name", "")))
+        target_box = global_store._ensure_box(storage, str(change.get("box_name", "")))
+        item_name = _normalize_text(str(change.get("item_name", "")))
+        existing_item, existing_box = global_store._find_item(storage, item_name)
+        if existing_item is None:
+            existing_item = {}
+            target_box.setdefault("items", []).append(existing_item)
+        elif existing_box is not None and existing_box is not target_box:
+            existing_box["items"] = [item for item in existing_box.get("items", []) if item is not existing_item]
+            target_box.setdefault("items", []).append(existing_item)
+        existing_item.update(
+            {
+                "name": item_name,
+                "quantity": float(change.get("quantity", 0)),
+                "unit": str(change.get("unit", "")),
+                "category": _normalize_optional(change.get("category")),
+                "note": _normalize_optional(change.get("note")),
+                "updated_at": _now_ms(),
+            }
+        )
+
+    def _apply_move_item(self, snapshot: dict[str, Any], change: dict[str, Any]) -> None:
+        global_store = self._global_store()
+        storage = global_store._ensure_storage(snapshot, str(change.get("storage_name", "")))
+        item_name = _normalize_text(str(change.get("item_name", "")))
+        target_box = global_store._ensure_box(storage, str(change.get("target_box_name", "")))
+        item, current_box = global_store._find_item(storage, item_name)
+        if item is None or current_box is None:
+            return
+        current_box["items"] = [candidate for candidate in current_box.get("items", []) if candidate is not item]
+        item["updated_at"] = _now_ms()
+        target_box.setdefault("items", []).append(item)
+
+    def _apply_delete_item(self, snapshot: dict[str, Any], change: dict[str, Any]) -> None:
+        global_store = self._global_store()
+        storage = global_store._ensure_storage(snapshot, str(change.get("storage_name", "")))
+        item, current_box = global_store._find_item(storage, str(change.get("item_name", "")))
+        if item is None or current_box is None:
+            return
+        current_box["items"] = [candidate for candidate in current_box.get("items", []) if candidate is not item]
+
+    def _peer_store(self, peer_key: str) -> InventorySyncStore:
+        return InventorySyncStore(
+            root=self.root / "peers" / peer_key,
+            knowledge_root=self.knowledge_root,
+            knowledge_relative_dir=Path("projects") / "fridge-system" / "peers" / peer_key,
+        )
+
+    def _global_store(self) -> InventorySyncStore:
+        return InventorySyncStore(
+            root=self.root,
+            knowledge_root=self.knowledge_root,
+            knowledge_relative_dir=Path("projects") / "fridge-system",
+        )
+
+
+def load_effective_inventory_snapshot(root: Path) -> dict[str, Any] | None:
+    global_store = InventorySyncStore(root=root, knowledge_root=root)
+    snapshot = global_store.load_snapshot()
+    if snapshot is None:
+        return None
+
+    peers_dir = root / "peers"
+    if not peers_dir.exists():
+        return snapshot
+
+    effective = json.loads(json.dumps(snapshot))
+    helper = MultiPeerInventorySyncStore(root=root, knowledge_root=root)
+    for peer_dir in sorted(child for child in peers_dir.iterdir() if child.is_dir()):
+        peer_store = helper._peer_store(peer_dir.name)
+        state = peer_store._load_change_state()
+        for change in state.get("changes", []):
+            helper._apply_change(effective, change)
+    return effective
+
+
 class InventorySyncServer:
     def __init__(
         self,
@@ -452,7 +717,7 @@ class InventorySyncServer:
         host: str,
         port: int,
         token: str | None,
-        store: InventorySyncStore,
+        store: InventorySyncStore | MultiPeerInventorySyncStore,
     ) -> None:
         self._host = host
         self._port = port
@@ -479,7 +744,7 @@ class InventorySyncServer:
                 query = parse_qs(parsed.query)
                 after_seq = int(query.get("after", ["0"])[0] or "0")
                 payload = {"ok": True}
-                payload.update(store.get_changes(after_seq))
+                payload.update(store.get_changes_for_ip(after_seq, client_ip=self.client_address[0]))
                 self._send_json(payload, HTTPStatus.OK)
 
             def do_POST(self) -> None:  # noqa: N802
@@ -495,8 +760,9 @@ class InventorySyncServer:
                     payload = json.loads(raw_body)
                     acknowledged_change_seq = payload.get("acknowledged_change_seq")
                     source = str(payload.get("source", "android"))
-                    summary = store.save_snapshot(
+                    summary = store.save_snapshot_for_ip(
                         payload,
+                        client_ip=self.client_address[0],
                         acknowledged_change_seq=int(acknowledged_change_seq)
                         if acknowledged_change_seq is not None
                         else None,

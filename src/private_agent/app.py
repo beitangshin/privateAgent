@@ -9,7 +9,7 @@ from private_agent.knowledge import LocalKnowledgeBase
 from private_agent.models import DeepSeekCloudBackend, MockModelBackend
 from private_agent.policy import PolicyEngine
 from private_agent.storage import StateStore
-from private_agent.sync import InventorySyncStore
+from private_agent.sync import InventorySyncStore, MultiPeerInventorySyncStore
 from private_agent.tools import ToolContext, ToolRegistry, build_builtin_tools
 
 
@@ -74,8 +74,15 @@ def build_app() -> AgentService:
             settings.knowledge_base_dir,
             max_snippets=settings.knowledge_max_snippets,
         ),
-        inventory_store=InventorySyncStore(
-            root=settings.inventory_sync_dir,
-            knowledge_root=settings.knowledge_base_dir,
+        inventory_store=(
+            MultiPeerInventorySyncStore(
+                root=settings.inventory_sync_dir,
+                knowledge_root=settings.knowledge_base_dir,
+            )
+            if settings.inventory_sync_by_source_ip
+            else InventorySyncStore(
+                root=settings.inventory_sync_dir,
+                knowledge_root=settings.knowledge_base_dir,
+            )
         ),
     )

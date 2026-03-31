@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "private-agent"
-version = "0.1.0"
+version = "0.1.13"
 description = "Secure local-first personal remote-control AI assistant skeleton"
 readme = "README.md"
 requires-python = ">=3.11"

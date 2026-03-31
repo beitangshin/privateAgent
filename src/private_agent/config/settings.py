@@ -85,6 +85,7 @@ class Settings:
     inventory_sync_port: int
     inventory_sync_token: str | None
     inventory_sync_dir: Path
+    inventory_sync_by_source_ip: bool
 
 
 def load_settings() -> Settings:
@@ -180,4 +181,7 @@ def load_settings() -> Settings:
         ),
         inventory_sync_token=os.getenv("PRIVATE_AGENT_INVENTORY_SYNC_TOKEN"),
         inventory_sync_dir=inventory_sync_dir,
+        inventory_sync_by_source_ip=_parse_bool(
+            os.getenv("PRIVATE_AGENT_INVENTORY_SYNC_BY_SOURCE_IP"), default=False
+        ),
     )

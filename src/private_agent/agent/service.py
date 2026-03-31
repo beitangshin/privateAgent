@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -14,9 +15,10 @@ from private_agent.knowledge import LocalKnowledgeBase
 from private_agent.models.base import ModelBackend, ModelMessage, ModelPlanStep
 from private_agent.policy.engine import PolicyEngine
 from private_agent.storage.state import StateStore
-from private_agent.sync import InventorySyncStore
+from private_agent.sync import InventorySyncStore, MultiPeerInventorySyncStore
 from private_agent.tools.base import ToolRegistry
 from private_agent.transport.types import IncomingMessage
+from private_agent.version import APP_VERSION
 
 
 @dataclass(slots=True)
@@ -41,7 +43,7 @@ class AgentService:
         enabled_tool_names: set[str] | None = None,
         conversation_history_messages: int = 12,
         knowledge_base: LocalKnowledgeBase | None = None,
-        inventory_store: InventorySyncStore | None = None,
+        inventory_store: InventorySyncStore | MultiPeerInventorySyncStore | None = None,
     ) -> None:
         self._authorizer = authorizer
         self._registry = registry
@@ -162,6 +164,16 @@ class AgentService:
             }
 
             if not plan.steps:
+                if self._requires_tool_backed_query(message.text):
+                    return HandleResult(
+                        trace_id=trace_id,
+                        status="error",
+                        message=(
+                            "query-style requests must be backed by at least one local tool step; "
+                            "model returned an empty plan"
+                        ),
+                        data={"intent": plan.intent},
+                    )
                 summary_text = plan.notes or "No local action was required."
                 self._append_conversation_exchange(message, summary_text)
                 self._update_agent_session(
@@ -505,6 +517,17 @@ class AgentService:
             message="conversation memory cleared for this chat",
         )
 
+    def get_version(self, message: IncomingMessage) -> HandleResult:
+        trace_id = uuid.uuid4().hex[:12]
+        self._authorizer.verify(message.sender_id)
+        self._authorizer.verify_chat(message.chat_id)
+        return HandleResult(
+            trace_id=trace_id,
+            status="ok",
+            message=f"privateAgent version {APP_VERSION}",
+            data={"version": APP_VERSION},
+        )
+
     def search_knowledge(self, message: IncomingMessage, query: str) -> HandleResult:
         trace_id = uuid.uuid4().hex[:12]
         self._authorizer.verify(message.sender_id)
@@ -628,6 +651,52 @@ class AgentService:
         schema["requires_confirmation"] = spec.requires_confirmation
         schema["category"] = spec.category
         return schema
+
+    def _requires_tool_backed_query(self, text: str) -> bool:
+        normalized = text.strip().lower()
+        if not normalized:
+            return False
+        english_patterns = (
+            r"\bstatus\b",
+            r"\bhealth\b",
+            r"\bdisk\b",
+            r"\bprocess(?:es)?\b",
+            r"\bnetwork\b",
+            r"\binventory\b",
+            r"\brepo\b",
+            r"\brepository\b",
+            r"\bsearch\b",
+            r"\bfind\b",
+            r"\blist\b",
+            r"\bread\b",
+            r"\bshow\b",
+            r"\bcheck\b",
+            r"\binspect\b",
+            r"\blook up\b",
+            r"\bwhat is\b",
+            r"\bhow much\b",
+        )
+        if any(re.search(pattern, normalized) for pattern in english_patterns):
+            return True
+        chinese_markers = (
+            "有没有",
+            "是否",
+            "查询",
+            "查",
+            "看看",
+            "查看",
+            "搜索",
+            "列出",
+            "读取",
+            "显示",
+            "检查",
+            "状态",
+            "库存",
+            "仓库",
+            "文件",
+            "日志",
+        )
+        return any(marker in normalized for marker in chinese_markers)
 
     def _is_tool_enabled(self, tool_name: str) -> bool:
         if self._enabled_tool_names is None:

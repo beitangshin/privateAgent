@@ -14,6 +14,7 @@ class ParsedCommand:
 
 HELP_TEXT = """Available commands:
 /ping
+/version
 /status
 /health
 /disk
@@ -62,6 +63,8 @@ def parse_command(text: str) -> ParsedCommand:
 
     if command in {"/ping", "ping"}:
         return ParsedCommand(kind="tool", tool_name="ping", args={})
+    if command in {"/version", "version", "/ver"}:
+        return ParsedCommand(kind="version")
     if command in {"/status", "status"}:
         return ParsedCommand(kind="tool", tool_name="summarize_desktop_status", args={})
     if command == "/health":

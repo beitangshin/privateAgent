@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from functools import lru_cache
 import urllib.error
 import urllib.request
 from dataclasses import asdict
@@ -11,6 +12,17 @@ from typing import Any
 from private_agent.audit import ModelCallLogger
 
 from .base import ModelMessage, ModelPlan, ModelPlanStep, ModelSummary
+
+
+@lru_cache(maxsize=1)
+def _load_query_skill_text() -> str:
+    skill_path = (
+        Path(__file__).resolve().parent
+        / "skills"
+        / "telegram-query-routing"
+        / "SKILL.md"
+    )
+    return skill_path.read_text(encoding="utf-8").strip()
 
 
 class DeepSeekCloudBackend:
@@ -147,8 +159,11 @@ class DeepSeekCloudBackend:
             "tools are necessary. "
             "Return strict JSON only with keys intent, requires_confirmation, steps, "
             "response_style, and notes. Each step must contain tool_name and arguments. "
+            "For query-style requests, use tool-first planning and do not return zero steps when a "
+            "read-only tool can answer. "
             f"Prompt version: {self._prompt_version}. "
             f"{self._build_web_search_guidance(tools)} "
+            f"Query routing skill: {_load_query_skill_text()} "
             f"Session context: {session_payload}. "
             f"Available tools: {tool_payload}"
         )

@@ -26,3 +26,5 @@ def test_plan_prompt_includes_web_search_guidance(tmp_path: Path) -> None:
     assert "prefer 1-3 focused searches" in system_prompt
     assert "local market's search vocabulary" in system_prompt
     assert "concrete listing or primary-source domains" in system_prompt
+    assert "telegram-query-routing" in system_prompt
+    assert "For query-style requests, produce at least one tool step." in system_prompt

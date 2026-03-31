@@ -2,6 +2,7 @@ from pathlib import Path
 
 import private_agent.tools.builtin as builtin_tools
 from private_agent.sync import InventorySyncStore
+from private_agent.run_telegram import _format_result_message
 from private_agent.tools import ToolContext, ToolRegistry, build_builtin_tools
 
 
@@ -245,6 +246,85 @@ def test_get_inventory_snapshot_reads_latest_sync(tmp_path: Path) -> None:
     assert result["storage_count"] == 1
     assert result["matches"][0]["storage"] == "Kitchen"
     assert result["matches"][0]["box"] == "Top Shelf"
+
+
+def test_get_inventory_snapshot_includes_pending_peer_changes(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    store = InventorySyncStore(root=context.inventory_sync_dir, knowledge_root=tmp_path / "knowledge")
+    store.save_snapshot(
+        {
+            "exported_at": "2026-03-31T12:00:00Z",
+            "app_version": "android",
+            "storages": [{"name": "Kitchen", "boxes": [{"name": "Top Shelf", "items": []}]}],
+        },
+        source="android",
+    )
+    peer_store = InventorySyncStore(
+        root=context.inventory_sync_dir / "peers" / "192.168.1.10",
+        knowledge_root=tmp_path / "knowledge",
+    )
+    peer_store._append_change(
+        {
+            "type": "upsert_item",
+            "storage_name": "Kitchen",
+            "box_name": "Top Shelf",
+            "item_name": "Eggs",
+            "quantity": 2.0,
+            "unit": "Box",
+            "category": "Food",
+            "note": None,
+        }
+    )
+
+    registry = ToolRegistry(build_builtin_tools())
+    spec = registry.get("get_inventory_snapshot")
+    result = spec.handler(spec.input_model(query="eggs"), context)
+
+    assert result["available"] is True
+    assert result["matches"][0]["name"] == "Eggs"
+
+
+def test_format_result_message_renders_inventory_query_without_json() -> None:
+    class Result:
+        status = "ok"
+        message = "tool execution succeeded"
+        data = {
+            "available": True,
+            "storage_count": 1,
+            "matches": [],
+            "query": "鸡蛋",
+        }
+
+    formatted = _format_result_message(Result())
+
+    assert formatted == "没有找到“鸡蛋”。"
+
+
+def test_format_result_message_renders_inventory_matches_without_json() -> None:
+    class Result:
+        status = "ok"
+        message = "tool execution succeeded"
+        data = {
+            "available": True,
+            "storage_count": 1,
+            "query": "鸡蛋",
+            "matches": [
+                {
+                    "name": "鸡蛋",
+                    "quantity": 2,
+                    "unit": "盒",
+                    "storage": "冰箱",
+                    "box": "冷藏室",
+                    "category": "食材",
+                    "note": None,
+                }
+            ],
+        }
+
+    formatted = _format_result_message(Result())
+
+    assert "找到了 1 条“鸡蛋”相关库存" in formatted
+    assert "鸡蛋: 2盒，位置 冰箱 / 冷藏室，分类 食材" in formatted
 
 
 def test_inventory_store_prunes_acknowledged_changes(tmp_path: Path) -> None:
