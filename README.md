@@ -65,11 +65,13 @@ When `PRIVATE_AGENT_MODEL_BACKEND=deepseek_cloud`, you can also send natural-lan
 
 1. Create a virtual environment and install dependencies.
 
-```powershell
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
 python -m pip install -e .[dev]
 ```
 
-2. Fill in [`.env`](D:/projects/privateAgent/.env) using [`.env.example`](D:/projects/privateAgent/.env.example).
+2. Fill in [`.env`](/home/hil/privateAgent/.env) using [`.env.example`](/home/hil/privateAgent/.env.example).
 
 Important settings:
 
@@ -99,8 +101,8 @@ Important settings:
 
 3. If you do not know your Telegram IDs yet, send any message to the bot and run:
 
-```powershell
-$env:PYTHONPATH='src'
+```bash
+export PYTHONPATH=src
 python -m private_agent.bootstrap_telegram
 ```
 
@@ -114,9 +116,9 @@ python -m pytest
 
 ### Foreground
 
-```powershell
-cd D:\projects\privateAgent
-$env:PYTHONPATH='src'
+```bash
+cd /home/hil/privateAgent
+export PYTHONPATH=src
 python -m private_agent.run_telegram
 ```
 
@@ -132,35 +134,38 @@ http://<bind-host>:<port>/inventory/sync
 
 Start:
 
-```powershell
-cd D:\projects\privateAgent
-powershell -ExecutionPolicy Bypass -File .\scripts\start_telegram_bot.ps1
+```bash
+cd /home/hil/privateAgent
+chmod +x scripts/*.sh
+./scripts/start_telegram_bot.sh
 ```
 
 Stop:
 
-```powershell
-cd D:\projects\privateAgent
-powershell -ExecutionPolicy Bypass -File .\scripts\stop_telegram_bot.ps1
+```bash
+cd /home/hil/privateAgent
+./scripts/stop_telegram_bot.sh
 ```
 
 Status:
 
-```powershell
-cd D:\projects\privateAgent
-powershell -ExecutionPolicy Bypass -File .\scripts\status_telegram_bot.ps1
+```bash
+cd /home/hil/privateAgent
+./scripts/status_telegram_bot.sh
 ```
+
+Windows PowerShell scripts are still available under `scripts/*.ps1` if you need them on Windows.
 
 ## DeepSeek Cloud Mode
 
 To use DeepSeek official API:
 
-```powershell
+```bash
 PRIVATE_AGENT_MODEL_BACKEND=deepseek_cloud
 PRIVATE_AGENT_DEEPSEEK_API_KEY=your_key_here
 PRIVATE_AGENT_DEEPSEEK_BASE_URL=https://api.deepseek.com
 PRIVATE_AGENT_DEEPSEEK_MODEL=deepseek-chat
-PRIVATE_AGENT_MODEL_CALL_LOG_PATH=D:\projects\privateAgent\data\model_calls.log
+PRIVATE_AGENT_MODEL_CALL_LOG_PATH=/home/hil/privateAgent/data/model_calls.log
 ```
 
 How the natural-language flow works:
@@ -212,12 +217,12 @@ Conflict model:
 
 Suggested `.env` settings:
 
-```powershell
+```bash
 PRIVATE_AGENT_ENABLE_INVENTORY_SYNC=true
 PRIVATE_AGENT_INVENTORY_SYNC_BIND_HOST=0.0.0.0
 PRIVATE_AGENT_INVENTORY_SYNC_PORT=8765
 PRIVATE_AGENT_INVENTORY_SYNC_TOKEN=replace_with_your_token
-PRIVATE_AGENT_INVENTORY_SYNC_DIR=D:\projects\privateAgent\data\inventory_sync
+PRIVATE_AGENT_INVENTORY_SYNC_DIR=/home/hil/privateAgent/data/inventory_sync
 ```
 
 Telegram inventory commands:
@@ -246,11 +251,11 @@ Suggested knowledge structure:
 
 Starter templates created in the repo:
 
-- `D:\projects\privateAgent\data\knowledge\README.md`
-- `D:\projects\privateAgent\data\knowledge\profile\user-preferences.md`
-- `D:\projects\privateAgent\data\knowledge\projects\project-template.md`
-- `D:\projects\privateAgent\data\knowledge\procedures\procedure-template.md`
-- `D:\projects\privateAgent\data\knowledge\references\environment-notes.md`
+- `data/knowledge/README.md`
+- `data/knowledge/profile/user-preferences.md`
+- `data/knowledge/projects/project-template.md`
+- `data/knowledge/procedures/procedure-template.md`
+- `data/knowledge/references/environment-notes.md`
 
 Web search safety boundary:
 

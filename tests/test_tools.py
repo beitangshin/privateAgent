@@ -68,6 +68,7 @@ def test_get_system_health_returns_mocked_payload(tmp_path: Path, monkeypatch) -
     registry = ToolRegistry(build_builtin_tools())
     spec = registry.get("get_system_health")
 
+    monkeypatch.setattr(builtin_tools, "_is_windows", lambda: True)
     monkeypatch.setattr(
         builtin_tools,
         "_run_powershell_json",

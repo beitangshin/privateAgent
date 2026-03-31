@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import locale
 import os
 import platform
@@ -110,7 +109,7 @@ def _search_duckduckgo_results(
     request = urllib.request.Request(
         url=f"https://html.duckduckgo.com/html/?{params}",
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) privateAgent/1.0",
+            "User-Agent": "privateAgent/1.0 (+https://duckduckgo.com)",
         },
     )
     with urllib.request.urlopen(request, timeout=timeout_sec) as response:
